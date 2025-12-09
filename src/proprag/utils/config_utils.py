@@ -150,7 +150,7 @@ class BaseConfig:
         metadata={"help": "Similarity threshold to include candidate synonymy nodes."}
     )
     is_directed_graph: bool = field(
-        default=False,
+        default=True, # [Modified] Default to True for Rashomon
         metadata={"help": "Whether the graph is directed or not."}
     )
 
@@ -228,6 +228,6 @@ class BaseConfig:
         if self.save_dir is None: # If save_dir not given
             if self.dataset is None: self.save_dir = 'outputs' # running freely
             else: self.save_dir = os.path.join('outputs', self.dataset) # customize your dataset's output dir here
-        with open('openrouter_api_key.txt', 'r') as f:
-            self.api_key = f.read().strip()
+        # with open('openrouter_api_key.txt', 'r') as f:
+        #     self.api_key = f.read().strip()
         logger.debug(f"Initializing the highest level of save_dir to be {self.save_dir}")

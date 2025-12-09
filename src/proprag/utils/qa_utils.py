@@ -165,7 +165,7 @@ def merge_elements_with_same_first_line(elements, prefix='Wikipedia Title: '):
 
 def reason_step(dataset, prompt_template_manager: PromptTemplateManager, query: str, passages: list, thoughts: list, llm_client: CacheOpenAI):
     """
-    Given few-shot samples, query, previous retrieved passages, and previous thoughts, generate the next thought with OpenAI models. The generated thought is used for further retrieval step.
+    Given few-shot samples, query, previous retrieved passages, and previous thoughts, generate the next thought with OpenAI NV-Embed-v2. The generated thought is used for further retrieval step.
     :return: next thought
     """
 

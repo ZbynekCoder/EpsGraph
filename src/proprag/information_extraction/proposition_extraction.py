@@ -21,7 +21,7 @@ import logging
 
 # Regex to find the structure, capturing text and entities content
 # Using re.DOTALL flag later to handle multi-line text fields
-REGEX_PATTERN = r'{\s*"text":\s*"(?P<text>.*?)"\s*,\s*"entities":\s*\[(?P<entities_content>.*?)]\s*}'
+REGEX_PATTERN = r'{\s*"source":\s*"(?P<source>.*?)",\s*"attitude":\s*"(?P<attitude>.*?)",\s*"text":\s*"(?P<text>.*?)",\s*"entities":\s*\[(?P<entities_content>.*?)\]\s*}'
 
 def fix_and_format_json_segment(original_segment: str, text_content: str, entities_content: str) -> str:
     """
@@ -495,96 +495,53 @@ class PropositionExtractor:
             propositions=propositions,
             metadata=metadata
         )
-    
+
+    # 替换原有的 _extract_propositions_from_response 方法
     def _extract_propositions_from_response(self, response: str) -> Dict:
         """
-        Extract propositions from the LLM response.
-        
-        Args:
-            response: The raw response from the LLM
-            
-        Returns:
-            Dictionary containing the extracted propositions
+        Extract beliefs from the LLM response.
         """
-        # # First, try to use the advanced JSON parsing function
-        # try:
-        #     fixed_json = maximal_parsable_json(response)
-        #     if fixed_json:
-        #         result = json.loads(fixed_json)
-        #         if "propositions" in result:
-        #             return result
-        # except Exception as e:
-        #     logger.debug(f"Advanced JSON parsing failed: {e}")
-            
-        # Fallback to regex-based extraction
-        pattern = r'\{[^{}]*"propositions"\s*:'
-
-        proposition_pattern = r'\{\s*"text":\s*"(?:\\.|[^\\"])*"\s*,\s*"entities":\s*\[(?:\s*"(?:\\.|[^\\"])*"\s*(?:,\s*"(?:\\.|[^\\"])*"\s*)*)?\s*\]\s*\}'
-
-        match = re.search(pattern, response, re.DOTALL)
-        if not match:
-            raise AttributeError(f"JSON response is invalid: {response}")
-
-        start_idx = match.span()[0]
-        curly_braces_count = 0
-        
-        in_quote = False
-        escape = False
-        idx = start_idx
-        response_len = len(response)
-        while idx < response_len:
-            char = response[idx]
-            if escape:
-                if char == 'u': # unicode
-                    idx += 5
-                else:
-                    idx += 1
-                escape = False
-                continue
-            if char == '{' and not in_quote:
-                curly_braces_count += 1
-            elif char == '}' and not in_quote:
-                curly_braces_count -= 1
-            elif char == '"':
-                in_quote = not in_quote
-            elif char == '\\':
-                escape = True
-            if curly_braces_count == 0:
-                break
-            idx += 1
-        if curly_braces_count > 0: # Incomplete Suspect
-            if response.count('{') != response.count('}'): # Likely a mismatched quote issue
-                raise AttributeError(f"JSON response is incomplete: {response}")
-            else: # revert idx to the last curly brace
-                idx = response.rfind('}', 0, idx)
-        json_str = response[start_idx:idx+1]
-        
-        # if match:
-        #     try:
-        #         return json.loads(match.group())
-        #     except json.JSONDecodeError:
-        #         # Attempt to fix the JSON
-        #         try:
-        #             fixed_match = match.group().replace("'", '"')
-        #             return json.loads(fixed_match)
-        #         except json.JSONDecodeError:
-        #             # If JSON parsing still fails, try a manual approach
-        #             result = self._extract_propositions_manually(response)
-        #             if result["propositions"]:
-        #                 return result
+        # 清理 Markdown 标记 (Ollama 的模型经常喜欢加 ```json)
+        clean_response = response.replace("```json", "").replace("```", "").strip()
 
         try:
-            loaded_json = json.loads(json_str)
+            loaded_json = json.loads(clean_response)
         except json.JSONDecodeError:
-            json_str = fix_large_json_text(json_str)
-            loaded_json = json.loads(json_str)
-            logger.info(f"JSON fix successful!")
-        # Fix the JSON as it is not complete
-        for prop in loaded_json["propositions"]:
-            assert "text" in prop and "entities" in prop
-            # Regenerate using higher temperature
-        return loaded_json
-    
+            # 如果简单的解析失败，尝试原来的修复逻辑 (假定你保留了 fix_large_json_text)
+            # 注意：如果 fix_large_json_text 内部逻辑太复杂且绑定了旧格式，可以直接跳过，
+            # 因为 Llama-3.3-70B 生成 JSON 的能力通常很强。
+            logger.warning(f"JSON parsing failed, raw: {clean_response[:50]}...")
+            return {"propositions": []}
+
+        extracted_beliefs = []
+
+        # 优先寻找 "beliefs" 字段
+        if "beliefs" in loaded_json:
+            for item in loaded_json["beliefs"]:
+                # 确保必需字段存在，没有的话给默认值
+                belief = {
+                    "text": item.get("text", ""),
+                    "entities": item.get("entities", []),
+                    "source": item.get("source", "GlobalContext"),
+                    "attitude": item.get("attitude", "fact")
+                }
+                extracted_beliefs.append(belief)
+
+        # 兼容旧的 "propositions" 字段
+        elif "propositions" in loaded_json:
+            for item in loaded_json["propositions"]:
+                belief = {
+                    "text": item.get("text", ""),
+                    "entities": item.get("entities", []),
+                    "source": "GlobalContext",  # 旧格式默认值
+                    "attitude": "fact"
+                }
+                extracted_beliefs.append(belief)
+
+        # 关键：PropRAG 的后续代码(enhanced_openie)期望返回键名为 "propositions" 的字典
+        # 即使我们在逻辑上把它叫 beliefs，为了不改动更多代码，这里 key 依然叫 propositions
+        return {"propositions": extracted_beliefs}
+
     def _extract_propositions_manually(self, response: str) -> Dict:
         """
         Manually extract propositions from text when JSON parsing fails.

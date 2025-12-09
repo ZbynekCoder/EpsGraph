@@ -125,6 +125,9 @@ class PropRAG:
 
         self.ready_to_retrieve = False
 
+        # [Rashomon Fix] 初始化时加载 Map
+        self.load_proposition_map()
+
 
     def initialize_graph(self):
         """
@@ -158,6 +161,24 @@ class PropRAG:
                 f"Loaded graph from {self._graphml_xml_file} with {preloaded_graph.vcount()} nodes, {preloaded_graph.ecount()} edges"
             )
             return preloaded_graph
+
+    def load_proposition_map(self):
+        """
+        [Rashomon Fix] Load the proposition_to_entities_map from disk.
+        """
+        map_path = os.path.join(self.working_dir, "proposition_map.json")
+        if os.path.exists(map_path):
+            logger.info(f"Loading proposition map from {map_path}")
+            try:
+                with open(map_path, 'r', encoding='utf-8') as f:
+                    self.proposition_to_entities_map = json.load(f)
+                logger.info(f"Loaded {len(self.proposition_to_entities_map)} propositions.")
+            except Exception as e:
+                logger.error(f"Failed to load proposition map: {e}")
+                self.proposition_to_entities_map = {}
+        else:
+            logger.warning("Proposition map file not found. If this is a new index, it will be created.")
+            self.proposition_to_entities_map = {}
 
     def index(self, docs: List[str]):
         """
@@ -238,7 +259,12 @@ class PropRAG:
             if "text" in prop and "entities" in prop:
                 prop_text = prop["text"]
                 prop_key = compute_mdhash_id(prop_text, prefix="proposition-")
-                self.proposition_to_entities_map[prop_key] = prop["entities"]
+                self.proposition_to_entities_map[prop_key] = {
+                    "text": prop["text"],
+                    "entities": prop["entities"],
+                    "source": prop.get("source", "GlobalContext"),
+                    "attitude": prop.get("attitude", "fact")
+                }
             else:
                 logger.warning(f"Skipping proposition without required fields: {prop}")
         
@@ -266,6 +292,12 @@ class PropRAG:
 
             self.augment_graph()
             self.save_igraph()
+
+            # [Rashomon Fix] 保存 proposition_to_entities_map
+            map_path = os.path.join(self.working_dir, "proposition_map.json")
+            logger.info(f"Saving proposition map to {map_path}")
+            with open(map_path, 'w', encoding='utf-8') as f:
+                json.dump(self.proposition_to_entities_map, f, ensure_ascii=False, indent=2)
 
     def retrieve(self,
                  queries: List[str],
@@ -818,35 +850,64 @@ class PropRAG:
 
     def add_new_nodes(self):
         """
-        Adds new nodes to the graph from entity and passage embedding stores based on their attributes.
+        [Rashomon Modified]
+        Adds new nodes to the graph from Entity, Proposition (Event), and Passage embedding stores.
 
-        This method identifies and adds new nodes to the graph by comparing existing nodes
-        in the graph and nodes retrieved from the entity embedding store and the passage
-        embedding store. The method checks attributes and ensures no duplicates are added.
-        New nodes are prepared and added in bulk to optimize graph updates.
+        This method ensures that all three types of nodes (Agent/Entity, Belief/Event, Passage)
+        are properly added to the igraph structure with their attributes.
         """
+        logger.info("Adding new nodes (Agents, Beliefs, Entities, Passages) to graph...")
 
-        existing_nodes = {v["name"]: v for v in self.graph.vs if "name" in v.attributes()}
+        # 1. 获取现有节点，避免重复
+        existing_nodes = set(self.graph.vs["name"]) if "name" in self.graph.vs.attribute_names() else set()
 
-        entity_nodes = self.entity_embedding_store.get_text_for_all_rows()
-        passage_nodes = self.chunk_embedding_store.get_text_for_all_rows()
+        # 2. 从三个 Store 获取所有数据
+        # 这里的 key 是 md5 hash (e.g., "entity-xxx", "proposition-yyy", "chunk-zzz")
+        entity_nodes_data = self.entity_embedding_store.get_text_for_all_rows()
+        passage_nodes_data = self.chunk_embedding_store.get_text_for_all_rows()
+        proposition_nodes_data = self.proposition_embedding_store.get_text_for_all_rows()
 
+        # 3. 合并所有潜在节点
+        all_potential_nodes = {}
+        all_potential_nodes.update(entity_nodes_data)  # type: entity
+        all_potential_nodes.update(passage_nodes_data)  # type: passage
+        all_potential_nodes.update(proposition_nodes_data)  # type: belief (new)
 
-        nodes = entity_nodes
-        nodes.update(passage_nodes)
+        # 4. 准备批量插入的数据结构
+        # igraph.add_vertices(attributes=...) 需要一个字典，key是属性名，value是属性值列表
+        attributes_batch = defaultdict(list)
+        nodes_to_add_count = 0
 
-
-        new_nodes = {}
-        for node_id, node in nodes.items():
-            node['name'] = node_id
+        for node_id, node_data in all_potential_nodes.items():
             if node_id not in existing_nodes:
-                for k, v in node.items():
-                    if k not in new_nodes:
-                        new_nodes[k] = []
-                    new_nodes[k].append(v)
+                nodes_to_add_count += 1
 
-        if len(new_nodes) > 0:
-            self.graph.add_vertices(n=len(next(iter(new_nodes.values()))), attributes=new_nodes)
+                # 必须属性: name
+                attributes_batch['name'].append(node_id)
+
+                # 内容属性: content (文本)
+                attributes_batch['content'].append(node_data.get('content', ''))
+
+                # [新增] 类型属性: type
+                # 根据 ID 前缀判断
+                if node_id.startswith("entity-"):
+                    attributes_batch['type'].append("entity")  # Agent 也是 entity
+                elif node_id.startswith("proposition-"):
+                    attributes_batch['type'].append("belief")  # Event
+                elif node_id.startswith("chunk-"):
+                    attributes_batch['type'].append("passage")
+                else:
+                    attributes_batch['type'].append("unknown")
+
+                # 其他属性 (如果有 embedding 等，也可以在这里加，只要 Store 里有)
+                # 目前主要需要 name, content, type
+
+        # 5. 批量插入
+        if nodes_to_add_count > 0:
+            logger.info(f"Adding {nodes_to_add_count} new vertices to the graph.")
+            self.graph.add_vertices(n=nodes_to_add_count, attributes=dict(attributes_batch))
+        else:
+            logger.debug("No new vertices to add.")
 
     def add_new_edges(self):
         """
@@ -943,57 +1004,61 @@ class PropRAG:
 
     def add_proposition_edges_with_entity_connections(self):
         """
-        Add proposition edges to the graph where all entities within the same proposition
-        are fully connected to each other.
-        
-        This creates:
-        1. Connections between propositions and their entities
-        2. Direct connections between all entities within the same proposition (fully connected)
-        
-        Note: This method only collects relationships in node_to_node_stats.
-        Actual vertices and edges are added later by augment_graph().
+        [Rashomon Modified]
+        Constructs the Agent-Belief-Entity directed graph.
+
+        New Schema:
+        1. Agent Node -> (Agency Edge) -> Event Node
+        2. Event Node -> (Inclusion Edge) -> Entity Node
+
+        This method iterates through all extracted beliefs and adds the corresponding
+        nodes and edges to `self.node_to_node_stats` for batch insertion later.
         """
-        if "name" in self.graph.vs:
-            current_graph_nodes = set(self.graph.vs["name"])
-        else:
-            current_graph_nodes = set()
-            
-        logger.info(f"Adding proposition entities to graph with entity-entity connections")
-        
-        entity_to_chunks = defaultdict(set)
-        
-        for chunk_item in self.openie_info:
-            chunk_id = chunk_item['idx']
-            if 'propositions' in chunk_item:
-                for prop in chunk_item['propositions']:
-                    if 'entities' in prop:
-                        for entity_text in prop['entities']:
-                            entity_key = compute_mdhash_id(entity_text, prefix="entity-")
-                            entity_to_chunks[entity_key].add(chunk_id)
-        
-        for prop_key, entities in tqdm(self.proposition_to_entities_map.items(), desc="Adding proposition edges"):
-            if prop_key not in current_graph_nodes:
-                entity_keys = []
-                
-                for entity_text in entities:
-                    entity_key = compute_mdhash_id(entity_text, prefix="entity-")
-                    entity_keys.append(entity_key)
-                
-                for i in range(len(entity_keys)):
-                    for j in range(i+1, len(entity_keys)):
-                        entity1 = entity_keys[i]
-                        entity2 = entity_keys[j]
-                        
-                        self.node_to_node_stats[(entity1, entity2)] = self.node_to_node_stats.get(
-                            (entity1, entity2), 0.0) + 1
-                        self.node_to_node_stats[(entity2, entity1)] = self.node_to_node_stats.get(
-                            (entity2, entity1), 0.0) + 1
-        
-        for entity_key, chunk_set in entity_to_chunks.items():
-            self.ent_node_to_num_chunk[entity_key] = self.ent_node_to_num_chunk.get(entity_key, 0) + len(chunk_set)
-                
-        logger.info(f"Finished adding proposition edges with fully connected entity nodes")
-        
+        logger.info("Constructing Agent-Belief-Entity Directed Graph...")
+
+        # 统计计数器
+        num_agency_edges = 0
+        num_inclusion_edges = 0
+
+        # 遍历所有提取出的 Beliefs (Events)
+        # 注意：这里的 self.proposition_to_entities_map 需要在 index() 中被正确填充为 {prop_key: belief_dict}
+        # 我们稍后会在 index() 中修改填充逻辑
+
+        for prop_key, belief_data in self.proposition_to_entities_map.items():
+            # belief_data 现在的结构是:
+            # {'text':..., 'entities':..., 'source':..., 'attitude':...}
+
+            # 1. 获取 Source Agent
+            source_agent_name = belief_data.get('source', 'GlobalContext')
+            attitude = belief_data.get('attitude', 'fact')
+
+            # 2. 生成 Agent 节点的 Key (Entity 类型的节点统一加前缀)
+            agent_key = compute_mdhash_id(source_agent_name, prefix="entity-")
+
+            # 3. 生成 Event (Proposition) 节点的 Key (已经在 prop_key 中)
+            event_key = prop_key
+
+            # --- 添加边: Agent -> Event (Agency) ---
+            # 权重暂时设为 1.0，未来可以根据 attitude 的强度调整 (e.g. "doubts" = 0.5)
+            # 我们在 node_to_node_stats 中用 tuple key 来表示边: (from, to)
+            self.node_to_node_stats[(agent_key, event_key)] = 1.0
+            num_agency_edges += 1
+
+            # --- 添加边: Event -> Entity (Inclusion) ---
+            target_entities = belief_data.get('entities', [])
+            for entity_name in target_entities:
+                entity_key = compute_mdhash_id(entity_name, prefix="entity-")
+
+                # 避免自环 (Agent 指向包含自己的 Event)
+                # 虽然逻辑上 Agent 确实在 Event 里，但为了图游走不回环太快，可以保留或去掉
+                # 这里保留，因为 "Trump said Trump won" 是合理的
+
+                self.node_to_node_stats[(event_key, entity_key)] = 1.0
+                num_inclusion_edges += 1
+
+        logger.info(
+            f"Graph Construction Stats: {num_agency_edges} Agency edges, {num_inclusion_edges} Inclusion edges.")
+
     def prepare_retrieval_objects(self):
         """
         Prepares various in-memory objects and attributes necessary for fast retrieval processes, such as embedding data and graph relationships, ensuring consistency
@@ -1402,7 +1467,7 @@ class PropRAG:
                                         ppr_damping_factor = 0.75) -> Tuple[np.ndarray, np.ndarray, List, Dict, List]:
         """
         Computes document scores based on proposition-based similarity and relevance using personalized
-        PageRank (PPR) and dense retrieval models. This function combines the signal from the relevant
+        PageRank (PPR) and dense retrieval NV-Embed-v2. This function combines the signal from the relevant
         propositions identified with passage similarity and graph-based search for enhanced result ranking.
 
         Parameters:
@@ -1482,7 +1547,7 @@ class PropRAG:
                                         focus_top_k: int = 50) -> Tuple[np.ndarray, np.ndarray, List, Dict, List]:
         """
         Computes document scores based on proposition-based similarity and relevance using personalized
-        PageRank (PPR) and dense retrieval models. This function combines the signal from the relevant
+        PageRank (PPR) and dense retrieval NV-Embed-v2. This function combines the signal from the relevant
         propositions identified with passage similarity and graph-based search for enhanced result ranking.
 
         With focused graph approach, this runs a first iteration with the full graph and beam path length 1,

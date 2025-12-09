@@ -18,6 +18,7 @@ def retrieve_knn(query_ids: List[str], key_ids: List[str], query_vecs, key_vecs,
 
     """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"device: {device}")
 
     if len(key_vecs) == 0: return {}
 
