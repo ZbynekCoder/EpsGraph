@@ -104,7 +104,10 @@ Passage:
 {passage}
 ```
 
-Named entities: {named_entities}"""
+Named entities from current chunk: {named_entities}
+
+Known Canonical Entities from Global Registry (use these names if applicable):
+{known_entities}"""
 
 prompt_template = [
     {"role": "system", "content": proposition_system},

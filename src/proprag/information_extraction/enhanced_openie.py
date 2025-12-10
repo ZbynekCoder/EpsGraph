@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from tqdm import tqdm
 
 from ..prompts import PromptTemplateManager
+from ..utils.entity_registry import GlobalEntityRegistry
 from ..utils.logging_utils import get_logger
 from ..utils.llm_utils import fix_broken_generated_json, filter_invalid_triples
 from ..utils.misc_utils import TripleRawOutput, NerRawOutput, PropositionRawOutput, text_processing, RetryExecutor
@@ -57,12 +58,12 @@ class EnhancedOpenIE:
     This creates more contextually aware triples by first breaking passages into atomic propositions.
     """
     
-    def __init__(self, llm_model: CacheOpenAI):
+    def __init__(self, llm_model: CacheOpenAI, entity_registry: Optional[GlobalEntityRegistry] = None):
         # Init prompt template manager
         self.prompt_template_manager = PromptTemplateManager(role_mapping={"system": "system", "user": "user", "assistant": "assistant"})
         self.llm_model = llm_model
         # Initialize proposition extractor
-        self.proposition_extractor = PropositionExtractor(llm_model)
+        self.proposition_extractor = PropositionExtractor(llm_model=llm_model, entity_registry=entity_registry)
 
     def ner(self, chunk_key: str, passage: str, temperature=0.0, fix_attempt=False, use_cache=True) -> NerRawOutput:
         """

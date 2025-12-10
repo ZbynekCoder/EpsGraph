@@ -27,6 +27,7 @@ from .evaluation.retrieval_eval import RetrievalRecall
 from .evaluation.qa_eval import QAExactMatch, QAF1Score
 from .prompts.linking import get_query_instruction
 from .prompts.prompt_template_manager import PromptTemplateManager
+from .utils.entity_registry import GlobalEntityRegistry
 from .utils.misc_utils import *
 from .utils.embed_utils import retrieve_knn
 from .utils.typing import Triple, Proposition # Triple type hint remains as per rule
@@ -78,6 +79,7 @@ class PropRAG:
             self.global_config = global_config
             print("GlobalConfig!")
         print("global_config: ", self.global_config)
+
         if save_dir is not None:
             self.global_config.save_dir = save_dir
 
@@ -104,7 +106,9 @@ class PropRAG:
         self.llm_model: BaseLLM = _get_llm_class(self.global_config)
 
         logger.info("Using EnhancedOpenIE with proposition extraction")
-        self.openie = EnhancedOpenIE(llm_model=self.llm_model)
+        registry_path = os.path.join(self.working_dir, "entity_registry.json")
+        self.entity_registry = GlobalEntityRegistry(llm_model=self.llm_model, save_path=registry_path)
+        self.openie = EnhancedOpenIE(llm_model=self.llm_model, entity_registry=self.entity_registry)
 
         self.graph = self.initialize_graph()
 
@@ -127,6 +131,8 @@ class PropRAG:
 
         # [Rashomon Fix] 初始化时加载 Map
         self.load_proposition_map()
+        self.node_to_node_stats = {}
+        self.ent_node_to_num_chunk = {}
 
 
     def initialize_graph(self):
@@ -182,122 +188,122 @@ class PropRAG:
 
     def index(self, docs: List[str]):
         """
-        Indexes the given documents based on the HippoRAG 2 framework which generates an OpenIE knowledge graph
-        based on the given documents and encodes passages, entities and propositions separately for later retrieval.
-
-        Parameters:
-            docs : List[str]
-                A list of documents to be indexed.
+        [Rashomon Fix] Incremental Indexing.
+        Only processes NEW documents to avoid graph duplication.
         """
+        logger.info(f"Indexing Documents (Incremental Check)...")
 
-        logger.info(f"Indexing Documents")
+        # 1. 识别真正的新文档
+        existing_keys = set(self.chunk_embedding_store.get_all_ids())
+        self.chunk_embedding_store.insert_strings(docs)  # Store 内部会处理去重
+        current_keys = set(self.chunk_embedding_store.get_all_ids())
 
-        logger.info(f"Performing OpenIE")
+        # 计算差集，得到本次新增的 keys
+        new_chunk_keys = list(current_keys - existing_keys)
 
-        self.chunk_embedding_store.insert_strings(docs)
-        chunks = self.chunk_embedding_store.get_text_for_all_rows()
+        if not new_chunk_keys:
+            logger.info("No new documents detected. Skipping extraction and graph update.")
+            return
 
-        all_openie_info, chunk_keys_to_process = self.load_existing_openie(chunks.keys())
-        new_openie_rows = {k : chunks[k] for k in chunk_keys_to_process}
+        logger.info(f"Found {len(new_chunk_keys)} new documents to process.")
 
-        if len(chunk_keys_to_process) > 0:
-            
-            logger.info(f"Running EnhancedOpenIE in index")
-            new_ner_results_dict, _, new_proposition_results_dict_props = self.openie.batch_openie(
-                new_openie_rows
-            )
-            self.merge_openie_results(
-                all_openie_info, 
-                new_openie_rows, 
-                new_ner_results_dict, 
-                None, 
-                new_proposition_results_dict_props
-            )
+        # 2. 仅对新文档运行 OpenIE
+        all_chunks_text = self.chunk_embedding_store.get_text_for_all_rows()
+        new_rows = {k: all_chunks_text[k] for k in new_chunk_keys}
 
+        # 批量抽取
+        new_ner, _, new_props_raw = self.openie.batch_openie(new_rows)
+
+        # 3. 更新全局 OpenIE 记录 (用于存盘备份)
+        all_openie_info, _ = self.load_existing_openie(list(current_keys))
+        updated_openie_info = self.merge_openie_results(
+            all_openie_info, new_rows, new_ner, None, new_props_raw
+        )
+        self.openie_info = updated_openie_info
         if self.global_config.save_openie:
-            self.save_openie_results(all_openie_info)
+            self.save_openie_results(self.openie_info)
 
-        ner_results_dict, proposition_results_dict_reformatted = reformat_openie_results(all_openie_info) # proposition_results_dict_reformatted is unused
-        print(len(chunks), len(ner_results_dict), len(proposition_results_dict_reformatted), len(all_openie_info))
-        assert len(chunks) == len(ner_results_dict) == len(proposition_results_dict_reformatted)
+        # 4. 准备图更新数据
+        new_propositions_flat = []
+        new_chunk_prop_entities_map = []  # 对应 new_chunk_keys 的顺序
 
-        chunk_ids = list(chunks.keys())
-        logger.info(f"Processing propositions for embedding")
-        proposition_results_dict = {}
-        
-        self.proposition_to_passages = defaultdict(set)
-        
-        for chunk_item in all_openie_info:
-            chunk_id = chunk_item['idx']
-            if 'propositions' in chunk_item:
-                proposition_results_dict[chunk_id] = PropositionRawOutput(
-                    chunk_id=chunk_id,
-                    response="",
-                    metadata={},
-                    propositions=chunk_item['propositions']
-                )
-                
-                for prop in chunk_item['propositions']:
-                    if "text" in prop:
-                        prop_text = prop["text"]
-                        prop_key = compute_mdhash_id(prop_text, prefix="proposition-")
-                        self.proposition_to_passages[prop_key].add(chunk_id)
-        
-        chunk_propositions_list = [proposition_results_dict[chunk_id].propositions for chunk_id in chunk_ids]
-        self.chunk_propositions = {chunk_id: chunk_propositions_list[i] for i, chunk_id in enumerate(chunk_ids)}
-        entity_nodes, chunk_proposition_entities = extract_proposition_entities(chunk_propositions_list)
-        propositions_flat = flatten_propositions(chunk_propositions_list)
+        # 辅助构建临时 Map，用于快速查找
+        chunk_to_props_map = {k: v.propositions for k, v in new_props_raw.items()}
 
-        logger.info(f"Encoding Entities")
-        self.entity_embedding_store.insert_strings(entity_nodes)
-        
-        logger.info(f"Encoding Propositions")
-        self.proposition_embedding_store.insert_strings([prop['text'] for prop in propositions_flat])
-        
-        self.proposition_to_entities_map = {}
-        for prop in propositions_flat:
-            if "text" in prop and "entities" in prop:
-                prop_text = prop["text"]
-                prop_key = compute_mdhash_id(prop_text, prefix="proposition-")
+        for chunk_key in new_chunk_keys:
+            props = chunk_to_props_map.get(chunk_key, [])
+            # 收集该 Chunk 下所有 Prop 涉及的 Entities
+            entities_in_chunk = set()
+            for p in props:
+                entities_in_chunk.update(p.get("entities", []))
+                # 收集扁平化的 Props 用于 Embedding
+                new_propositions_flat.append(p)
+
+            new_chunk_prop_entities_map.append(list(entities_in_chunk))
+
+        # 5. Embedding (Store 会自动处理去重，所以直接传也没事，但为了效率还是只传新的好)
+        # 这里为了简单，传 new_propositions_flat，Store 内部其实是 append 模式
+        if new_propositions_flat:
+            logger.info(f"Encoding {len(new_propositions_flat)} new propositions...")
+            self.proposition_embedding_store.insert_strings([p['text'] for p in new_propositions_flat])
+
+        # Encoding Entities (收集所有新实体)
+        all_new_entities = set()
+        for ents in new_chunk_prop_entities_map:
+            all_new_entities.update(ents)
+        if all_new_entities:
+            logger.info(f"Encoding {len(all_new_entities)} new entities...")
+            self.entity_embedding_store.insert_strings(list(all_new_entities))
+
+        # 6. 更新 Proposition Map (内存 + 磁盘)
+        # [Critical Fix] 追加更新，不要清空
+        for prop in new_propositions_flat:
+            if "text" in prop:
+                prop_key = compute_mdhash_id(prop["text"], prefix="proposition-")
+
+                # --- 新增 DEBUG 打印 ---
+                source_from_prop = prop.get("source")
+                source_for_map = prop.get("source", "GlobalContext")
+                print(f"[DEBUG PropRAG.index map update] prop_key: {prop_key}")
+                print(
+                    f"        -> source_from_prop (raw from _normalize): {repr(source_from_prop)}, type: {type(source_from_prop)}")
+                print(
+                    f"        -> source_for_map (with GlobalContext fallback): {repr(source_for_map)}, type: {type(source_for_map)}")
+                # --- 确保这里使用的 source 变量是经过 fallback 的 ---
+
                 self.proposition_to_entities_map[prop_key] = {
                     "text": prop["text"],
-                    "entities": prop["entities"],
+                    "entities": prop.get("entities", []),
                     "source": prop.get("source", "GlobalContext"),
                     "attitude": prop.get("attitude", "fact")
                 }
-            else:
-                logger.warning(f"Skipping proposition without required fields: {prop}")
-        
-        props_with_passages = sum(len(self.proposition_to_passages[prop]) for prop in self.proposition_to_passages if self.proposition_to_passages[prop])
-        total_props = len(self.proposition_to_entities_map)
-        avg_passages = sum(len(passages) for passages in self.proposition_to_passages.values()) / max(1, len(self.proposition_to_passages))
-        
-        logger.info(f"Built proposition-passage map: {props_with_passages}/{total_props} propositions mapped.")
-        logger.info(f"Average passages per proposition: {avg_passages:.2f}")
 
-        logger.info(f"Constructing Graph")
+        # 更新 proposition_to_passages (用于统计，可选)
+        for chunk_key in new_chunk_keys:
+            props = chunk_to_props_map.get(chunk_key, [])
+            for p in props:
+                pk = compute_mdhash_id(p["text"], prefix="proposition-")
+                if not hasattr(self, 'proposition_to_passages'): self.proposition_to_passages = defaultdict(set)
+                self.proposition_to_passages[pk].add(chunk_key)
 
-        self.node_to_node_stats = {}
-        self.ent_node_to_num_chunk = {}
+        # 7. 增量建图 (直接操作 igraph)
+        logger.info("Updating Graph with new elements...")
+        self._add_new_proposition_edges(new_propositions_flat)
+        self._add_new_passage_edges(new_chunk_keys, new_chunk_prop_entities_map)
 
-        self.openie_info = all_openie_info
-        
-        logger.info("Using proposition-based graph construction")
-        self.add_proposition_edges_with_entity_connections()
-        num_new_chunks = self.add_passage_edges(chunk_ids, chunk_proposition_entities)
+        # 8. 同义词边 (可选：因为比较耗时且是全局的)
+        # 这里先只做保存，如果需要同义词，需要谨慎处理 node_to_node_stats 防止重复
+        # 简单起见，我们调用 add_synonymy_edges 但让 augment_graph 做去重检查
+        self.add_synonymy_edges()
+        self.augment_graph()  # 这里的 augment 现在只负责处理 node_to_node_stats 里的边
 
-        if num_new_chunks > 0:
-            logger.info(f"Found {num_new_chunks} new chunks to save into graph.")
-            self.add_synonymy_edges()
+        # 保存状态
+        self.save_igraph()
 
-            self.augment_graph()
-            self.save_igraph()
-
-            # [Rashomon Fix] 保存 proposition_to_entities_map
-            map_path = os.path.join(self.working_dir, "proposition_map.json")
-            logger.info(f"Saving proposition map to {map_path}")
-            with open(map_path, 'w', encoding='utf-8') as f:
-                json.dump(self.proposition_to_entities_map, f, ensure_ascii=False, indent=2)
+        map_path = os.path.join(self.working_dir, "proposition_map.json")
+        with open(map_path, 'w', encoding='utf-8') as f:
+            json.dump(self.proposition_to_entities_map, f, ensure_ascii=False, indent=2)
+        logger.info("Incremental Indexing Complete.")
 
     def retrieve(self,
                  queries: List[str],
@@ -841,12 +847,31 @@ class PropRAG:
         It ensures that the graph structure is extended to include additional components,
         and logs the completion status along with printing the updated graph information.
         """
-
+        # Add new nodes (safety check)
         self.add_new_nodes()
-        self.add_new_edges()
 
-        logger.info(f"Graph construction completed!")
-        print(self.get_graph_info())
+        # Add edges from stats (Synonyms)
+        if "name" in self.graph.vs.attribute_names():
+            existing_names = set(self.graph.vs["name"])
+        else:
+            return
+
+        edges_to_add = []
+        weights = []
+
+        for (u, v), w in self.node_to_node_stats.items():
+            if u in existing_names and v in existing_names:
+                # Check existence
+                if self.graph.get_eid(u, v, error=False) == -1:
+                    edges_to_add.append((u, v))
+                    weights.append(w)
+
+        if edges_to_add:
+            self.graph.add_edges(edges_to_add, attributes={"weight": weights})
+            logger.info(f"Augmented graph with {len(edges_to_add)} synonymy edges.")
+
+        # Clear stats to avoid reprocessing next time
+        self.node_to_node_stats = {}
 
     def add_new_nodes(self):
         """
@@ -1002,6 +1027,112 @@ class PropRAG:
 
         return graph_info
 
+    def _add_new_proposition_edges(self, new_propositions_flat: List[Dict]):
+        """
+        [Rashomon Helper] Add new Agent->Belief->Entity structures directly to graph.
+        Idempotent: Checks existence before adding.
+        """
+        # 获取当前图的节点名集合缓存
+        if "name" in self.graph.vs.attribute_names():
+            existing_names = set(self.graph.vs["name"])
+        else:
+            existing_names = set()
+
+        added_nodes = 0
+        added_edges = 0
+
+        for i, prop in enumerate(new_propositions_flat):
+            print(f"[DEBUG] Processing Prop {i}: {prop}")
+
+            source_raw = prop['source']
+            print(f"        -> raw source: {repr(source_raw)} type: {type(source_raw)}")
+
+            if not source_raw:
+                print("        -> Source is empty/None, forcing GlobalContext")
+                source_agent = "GlobalContext"
+            else:
+                source_agent = str(source_raw)  # 强制转字符串
+            # --- DEBUG END ---
+
+            text = prop.get("text", "")
+            if not text: continue
+
+            prop_key = compute_mdhash_id(text, prefix="proposition-")
+            agent_key = compute_mdhash_id(source_agent, prefix="entity-")
+
+            # 1. Add Agent Node
+            if agent_key not in existing_names:
+                self.graph.add_vertex(name=agent_key, type="entity", content=source_agent)
+                existing_names.add(agent_key)
+                added_nodes += 1
+
+            # 2. Add Belief Node
+            if prop_key not in existing_names:
+                self.graph.add_vertex(name=prop_key, type="belief", content=text)
+                existing_names.add(prop_key)
+                added_nodes += 1
+
+            # 3. Edge: Agent -> Belief (Agency)
+            if self.graph.get_eid(agent_key, prop_key, error=False) == -1:
+                self.graph.add_edge(agent_key, prop_key, type="agency")
+                added_edges += 1
+
+            # 4. Target Entities
+            for ent_name in prop.get("entities", []):
+                ent_key = compute_mdhash_id(ent_name, prefix="entity-")
+
+                # Add Entity Node
+                if ent_key not in existing_names:
+                    self.graph.add_vertex(name=ent_key, type="entity", content=ent_name)
+                    existing_names.add(ent_key)
+                    added_nodes += 1
+
+                # Edge: Belief -> Entity (Inclusion)
+                if self.graph.get_eid(prop_key, ent_key, error=False) == -1:
+                    self.graph.add_edge(prop_key, ent_key, type="inclusion")
+                    added_edges += 1
+
+        logger.info(f"Direct Graph Update: Added {added_nodes} nodes, {added_edges} edges from propositions.")
+
+    def _add_new_passage_edges(self, chunk_keys: List[str], entities_list: List[List[str]]):
+        """
+        [Rashomon Helper] Add Chunk->Entity edges.
+        Idempotent.
+        """
+        if "name" in self.graph.vs.attribute_names():
+            existing_names = set(self.graph.vs["name"])
+        else:
+            existing_names = set()
+
+        added_nodes = 0
+        added_edges = 0
+
+        all_chunks = self.chunk_embedding_store.get_text_for_all_rows()
+
+        for i, chunk_key in enumerate(chunk_keys):
+            # 1. Add Chunk Node
+            if chunk_key not in existing_names:
+                content = all_chunks.get(chunk_key, {}).get("content", "")
+                self.graph.add_vertex(name=chunk_key, type="chunk", content=content)
+                existing_names.add(chunk_key)
+                added_nodes += 1
+
+            # 2. Edges to Entities
+            ents = entities_list[i]
+            for ent_name in ents:
+                ent_key = compute_mdhash_id(ent_name, prefix="entity-")
+                # Entity node 应该在上面加过了，但防守一波
+                if ent_key not in existing_names:
+                    self.graph.add_vertex(name=ent_key, type="entity", content=ent_name)
+                    existing_names.add(ent_key)
+
+                # Edge: Chunk -> Entity (Contains)
+                if self.graph.get_eid(chunk_key, ent_key, error=False) == -1:
+                    self.graph.add_edge(chunk_key, ent_key, type="contains")
+                    added_edges += 1
+
+        logger.info(f"Direct Graph Update: Added {added_nodes} chunk nodes, {added_edges} chunk edges.")
+
     def add_proposition_edges_with_entity_connections(self):
         """
         [Rashomon Modified]
@@ -1014,50 +1145,51 @@ class PropRAG:
         This method iterates through all extracted beliefs and adds the corresponding
         nodes and edges to `self.node_to_node_stats` for batch insertion later.
         """
-        logger.info("Constructing Agent-Belief-Entity Directed Graph...")
-
-        # 统计计数器
-        num_agency_edges = 0
-        num_inclusion_edges = 0
-
-        # 遍历所有提取出的 Beliefs (Events)
-        # 注意：这里的 self.proposition_to_entities_map 需要在 index() 中被正确填充为 {prop_key: belief_dict}
-        # 我们稍后会在 index() 中修改填充逻辑
-
-        for prop_key, belief_data in self.proposition_to_entities_map.items():
-            # belief_data 现在的结构是:
-            # {'text':..., 'entities':..., 'source':..., 'attitude':...}
-
-            # 1. 获取 Source Agent
-            source_agent_name = belief_data.get('source', 'GlobalContext')
-            attitude = belief_data.get('attitude', 'fact')
-
-            # 2. 生成 Agent 节点的 Key (Entity 类型的节点统一加前缀)
-            agent_key = compute_mdhash_id(source_agent_name, prefix="entity-")
-
-            # 3. 生成 Event (Proposition) 节点的 Key (已经在 prop_key 中)
-            event_key = prop_key
-
-            # --- 添加边: Agent -> Event (Agency) ---
-            # 权重暂时设为 1.0，未来可以根据 attitude 的强度调整 (e.g. "doubts" = 0.5)
-            # 我们在 node_to_node_stats 中用 tuple key 来表示边: (from, to)
-            self.node_to_node_stats[(agent_key, event_key)] = 1.0
-            num_agency_edges += 1
-
-            # --- 添加边: Event -> Entity (Inclusion) ---
-            target_entities = belief_data.get('entities', [])
-            for entity_name in target_entities:
-                entity_key = compute_mdhash_id(entity_name, prefix="entity-")
-
-                # 避免自环 (Agent 指向包含自己的 Event)
-                # 虽然逻辑上 Agent 确实在 Event 里，但为了图游走不回环太快，可以保留或去掉
-                # 这里保留，因为 "Trump said Trump won" 是合理的
-
-                self.node_to_node_stats[(event_key, entity_key)] = 1.0
-                num_inclusion_edges += 1
-
-        logger.info(
-            f"Graph Construction Stats: {num_agency_edges} Agency edges, {num_inclusion_edges} Inclusion edges.")
+        # logger.info("Constructing Agent-Belief-Entity Directed Graph...")
+        #
+        # # 统计计数器
+        # num_agency_edges = 0
+        # num_inclusion_edges = 0
+        #
+        # # 遍历所有提取出的 Beliefs (Events)
+        # # 注意：这里的 self.proposition_to_entities_map 需要在 index() 中被正确填充为 {prop_key: belief_dict}
+        # # 我们稍后会在 index() 中修改填充逻辑
+        #
+        # for prop_key, belief_data in self.proposition_to_entities_map.items():
+        #     # belief_data 现在的结构是:
+        #     # {'text':..., 'entities':..., 'source':..., 'attitude':...}
+        #
+        #     # 1. 获取 Source Agent
+        #     source_agent_name = belief_data.get('source', 'GlobalContext')
+        #     attitude = belief_data.get('attitude', 'fact')
+        #
+        #     # 2. 生成 Agent 节点的 Key (Entity 类型的节点统一加前缀)
+        #     agent_key = compute_mdhash_id(source_agent_name, prefix="entity-")
+        #
+        #     # 3. 生成 Event (Proposition) 节点的 Key (已经在 prop_key 中)
+        #     event_key = prop_key
+        #
+        #     # --- 添加边: Agent -> Event (Agency) ---
+        #     # 权重暂时设为 1.0，未来可以根据 attitude 的强度调整 (e.g. "doubts" = 0.5)
+        #     # 我们在 node_to_node_stats 中用 tuple key 来表示边: (from, to)
+        #     self.node_to_node_stats[(agent_key, event_key)] = 1.0
+        #     num_agency_edges += 1
+        #
+        #     # --- 添加边: Event -> Entity (Inclusion) ---
+        #     target_entities = belief_data.get('entities', [])
+        #     for entity_name in target_entities:
+        #         entity_key = compute_mdhash_id(entity_name, prefix="entity-")
+        #
+        #         # 避免自环 (Agent 指向包含自己的 Event)
+        #         # 虽然逻辑上 Agent 确实在 Event 里，但为了图游走不回环太快，可以保留或去掉
+        #         # 这里保留，因为 "Trump said Trump won" 是合理的
+        #
+        #         self.node_to_node_stats[(event_key, entity_key)] = 1.0
+        #         num_inclusion_edges += 1
+        #
+        # logger.info(
+        #     f"Graph Construction Stats: {num_agency_edges} Agency edges, {num_inclusion_edges} Inclusion edges.")
+        pass
 
     def prepare_retrieval_objects(self):
         """
