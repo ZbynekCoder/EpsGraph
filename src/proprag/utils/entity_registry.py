@@ -17,6 +17,7 @@ class GlobalEntityRegistry:
         self.reverse_lookup: Dict[str, str] = {}  # Alias -> Canonical Name
 
         self.recent_entities = deque(maxlen=10)
+        self.context_history = deque(maxlen=3)
 
         self.llm = llm_model
         self.embedding_model = embedding_model
@@ -57,6 +58,12 @@ class GlobalEntityRegistry:
             logger.info(f"Embedding {len(canonical_names_to_embed)} new canonical entities for Registry.")
             self.entity_embedding_store.insert_strings(canonical_names_to_embed)
 
+    def update_context_history(self, text: str):
+        """将处理完的文本块加入历史缓存"""
+        if text and isinstance(text, str):
+            # 简单去重：如果和上一条不一样才加
+            if not self.context_history or self.context_history[-1] != text:
+                self.context_history.append(text)
 
     def resolve_and_add(self, candidate_entity_name: str, context_text: str, chunk_id: str, top_k_global_relevant: int = 5) -> str:
         """Synchronously resolves or adds an entity."""
@@ -73,6 +80,12 @@ class GlobalEntityRegistry:
             return canonical
 
         # Use LLM for resolution
+        # 准备历史文本字符串
+        if self.context_history:
+            prev_context_str = "\n---\n".join(self.context_history)
+        else:
+            prev_context_str = "None (Start of story)"
+
         recent_active_entities_str, other_globally_relevant_entities_str = self.get_formatted_entities_for_prompt(
             candidate_entity_name=candidate_entity_name,
             top_k_global_relevant=top_k_global_relevant
@@ -89,22 +102,28 @@ class GlobalEntityRegistry:
                 Respond in JSON: {"canonical_name": "...", "is_new": bool, "profile": "..."}"""
 
         user_prompt = f"""
-                Current Text Chunk: "{context_text}"
+                [PREVIOUS NARRATIVE CONTEXT] (What happened immediately before):
+                \"\"\"
+                {prev_context_str}
+                \"\"\"
 
-                [CRITICAL CONTEXT] Recently Active Entities (mentioned in previous chunks):
+                [CURRENT TEXT CHUNK]: 
+                "{context_text}"
+
+                [CANDIDATE ENTITIES] (Recently active):
                 {recent_active_entities_str}
 
-                [Knowledge Base] Globally Relevant Known Entities (Top {top_k_global_relevant} by embedding similarity):
+                [GLOBAL KNOWLEDGE]:
                 {other_globally_relevant_entities_str}
 
                 Task: Resolve the entity mention "{candidate_entity_name}".
 
                 Thinking Process:
-                1. Is "{candidate_entity_name}" a pronoun or reference (e.g., "he", "the source", "the plan")?
-                2. If YES, does it likely refer to someone in [Recently Active Entities]?
-                3. If NO, is it a variation of a [Globally Relevant Known Entities]?
+                1. Look at [PREVIOUS NARRATIVE CONTEXT]. Who was the last person speaking or acting?
+                2. If "{candidate_entity_name}" is "He"/"She", map it to that person.
+                3. If strict match found in [CANDIDATE ENTITIES], use it.
 
-                Output JSON:
+                Output JSON: {{"canonical_name": "...", "is_new": bool, "profile": "..."}}
                 """
 
         try:

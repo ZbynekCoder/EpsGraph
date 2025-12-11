@@ -1,50 +1,54 @@
 from ...utils.llm_utils import convert_format_to_template
 
-proposition_system = """You are an expert in narrative analysis. Your task is to extract propositions (atomic beliefs or events) from a given text.
-For each proposition, identify the 'source' (who holds the belief or performs the action), the 'attitude' (e.g., states, claims, believes, denies), the 'text' of the belief, and the 'entities' involved.
+proposition_system = """You are an expert in narrative analysis. Your task is to extract information from text, distinguishing between **Subjective Beliefs** and **Objective Traits/Facts**.
 
-**Critical Instructions for Coreference Resolution and Source Identification:**
-1.  **Prioritize Recently Active Entities**: If a pronoun (e.g., "He", "She", "They") or an ambiguous reference (e.g., "the source", "the plan") is used as a source or as an entity within the proposition, you MUST first attempt to resolve it to a specific character from the **'Recently Active Entities'** list. These are highly relevant and likely candidates for ambiguous references in the current passage.
-2.  **Then Check Globally Known Entities**: If not found in 'Recently Active Entities', try to resolve it from the 'Other Globally Known Entities' list. These entities are also known to the system and may be relevant.
-3.  **If Unresolvable**: If a source or an entity cannot be confidently resolved from the provided lists, use "Unknown Speaker" for source or the exact phrase from the text for entities.
-4.  The 'source' should be the most specific agent possible (e.g., "Jenner" instead of "a rat").
-5.  The 'text' should be a complete, self-contained statement.
-6.  The 'entities' list should contain the **canonical names** of all resolved entities involved in the belief.
+### Output Format
+You MUST respond with a JSON object. For each sentence/clause, decide its type:
 
-### Output Format:
-You MUST respond with a valid JSON object containing a list of "propositions" (or "beliefs").
-JSON Format:
+1.  **If it's a Subjective Belief/Action (someone thinks, says, or does something):**
+    - Use the "beliefs" list.
+    - `source`: The character acting/thinking (e.g., "Jenner", "He"). PRESERVE PRONOUNS.
+    - `attitude`: The verb (e.g., "argued", "thought").
+    - `text`: The content of the belief.
+
+2.  **If it's an Objective Trait/Fact (a description of a character or state):**
+    - Use the "traits" list.
+    - `entity`: The character being described (e.g., "Jenner").
+    - `trait`: The description itself (e.g., "is a cynical rat").
+
+**CRITICAL**: DO NOT use "Narrator" or "Unknown Source". If it's a description, it's a `trait`.
+
+### Example 1
+**Passage**: "Jenner was a cynical rat who loudly opposed Nicodemus's Plan."
+**Response**:
 {
-  "propositions": [
+  "traits": [
     {
-      "source": "string",
-      "attitude": "string",
-      "text": "string",
-      "entities": ["string", "string"]
+      "entity": "Jenner",
+      "trait": "is a cynical rat"
+    }
+  ],
+  "beliefs": [
+    {
+      "source": "Jenner",
+      "attitude": "opposed",
+      "text": "Jenner opposed Nicodemus's Plan.",
+      "entities": ["Jenner", "Nicodemus's Plan"]
     }
   ]
 }
 
-### Example:
-Passage: Trump claimed that he won the election, but CNN reported that Biden won.
-Named entities: ["Trump", "election", "CNN", "Biden"]
-Recently Active Entities: ["Trump"]
-Other Globally Known Entities: ["Biden", "CNN"]
-
-Response:
+### Example 2
+**Passage**: "He argued that stealing electricity was easier."
+**Response**:
 {
-  "propositions": [
+  "traits": [],
+  "beliefs": [
     {
-      "source": "Trump",
-      "attitude": "claimed",
-      "text": "Trump won the election.",
-      "entities": ["Trump", "election"]
-    },
-    {
-      "source": "CNN",
-      "attitude": "reported",
-      "text": "Biden won the election.",
-      "entities": ["CNN", "Biden", "election"]
+      "source": "He",
+      "attitude": "argued",
+      "text": "stealing electricity was easier.",
+      "entities": ["He", "stealing electricity"]
     }
   ]
 }

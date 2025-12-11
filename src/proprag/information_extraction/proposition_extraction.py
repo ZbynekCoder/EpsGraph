@@ -83,6 +83,8 @@ class PropositionExtractor:
             other_globally_known_entities=other_globally_relevant_entities_str
         )
 
+        print(proposition_input_message)
+
         # 2. Extract Raw Beliefs
         try:
             raw_response, metadata, _ = self.llm_model.infer(
@@ -117,6 +119,7 @@ class PropositionExtractor:
                 belief["source"] = canonical_source
                 belief["entities"] = list(set(canonical_entities))
                 canonical_beliefs.append(belief)
+            self.entity_registry.update_context_history(passage)
         else:
             canonical_beliefs = raw_beliefs
 
