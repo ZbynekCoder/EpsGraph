@@ -12,33 +12,26 @@ logger = logging.getLogger(__name__)
 
 
 class GlobalEntityRegistry:
-    def __init__(self, llm_model: Any, embedding_model: Any, entity_embedding_store: Any, save_path: Optional[str] = None):
+    def __init__(self, llm_model: Any, embedding_model: Any, entity_embedding_store: Any,
+                 save_path: Optional[str] = None):
         self.registry: Dict[str, Dict[str, Any]] = {}  # Canonical Name -> {profile, aliases}
         self.reverse_lookup: Dict[str, str] = {}  # Alias -> Canonical Name
-
         self.recent_entities = deque(maxlen=10)
         self.context_history = deque(maxlen=3)
-
         self.llm = llm_model
         self.embedding_model = embedding_model
         self.entity_embedding_store = entity_embedding_store
-        self._ensure_embeddings_for_registry()
-
         self.save_path = save_path
+
         if self.save_path and os.path.exists(self.save_path):
             self._load()
-        logger.info(f"GlobalEntityRegistry initialized with {len(self.registry)} entries.")
+        self._ensure_embeddings_for_registry()
 
     def _load(self):
-        try:
-            with open(self.save_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                self.registry = data.get("registry", {})
-                self.reverse_lookup = data.get("reverse_lookup", {})
-            logger.info(f"Loaded registry from {self.save_path}")
-        except Exception as e:
-            logger.error(f"Failed to load GlobalEntityRegistry: {e}")
-            raise
+        with open(self.save_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            self.registry = data.get("registry", {})
+            self.reverse_lookup = data.get("reverse_lookup", {})
 
     def _save(self):
         if self.save_path:
@@ -59,125 +52,9 @@ class GlobalEntityRegistry:
             self.entity_embedding_store.insert_strings(canonical_names_to_embed)
 
     def update_context_history(self, text: str):
-        """将处理完的文本块加入历史缓存"""
         if text and isinstance(text, str):
-            # 简单去重：如果和上一条不一样才加
             if not self.context_history or self.context_history[-1] != text:
                 self.context_history.append(text)
-
-    def resolve_and_add(self, candidate_entity_name: str, context_text: str, chunk_id: str, top_k_global_relevant: int = 5) -> str:
-        """Synchronously resolves or adds an entity."""
-        assert candidate_entity_name and isinstance(candidate_entity_name,
-                                                    str), "Candidate entity name must be a non-empty string."
-
-        candidate_entity_name = candidate_entity_name.strip()
-        if not candidate_entity_name: return ""
-
-        if candidate_entity_name in self.reverse_lookup:
-            canonical = self.reverse_lookup[candidate_entity_name]
-            if canonical not in self.recent_entities:
-                self.recent_entities.appendleft(canonical)
-            return canonical
-
-        # Use LLM for resolution
-        # 准备历史文本字符串
-        if self.context_history:
-            prev_context_str = "\n---\n".join(self.context_history)
-        else:
-            prev_context_str = "None (Start of story)"
-
-        recent_active_entities_str, other_globally_relevant_entities_str = self.get_formatted_entities_for_prompt(
-            candidate_entity_name=candidate_entity_name,
-            top_k_global_relevant=top_k_global_relevant
-        )
-
-        system_prompt = """You are an Entity Resolver with Context Awareness. 
-                Your task is to resolve an entity mention in a text to its Canonical Name.
-
-                Priority of Resolution:
-                1. **Context Match**: If the mention refers to someone in the 'Recently Active Entities' list (e.g., 'the source' -> 'Anonymous Source'), mapping them is the HIGHEST priority.
-                2. **Global Match**: If not recent, check the 'Globally Relevant Known Entities'.
-                3. **New Entity**: If strictly new, create a new canonical name.
-
-                Respond in JSON: {"canonical_name": "...", "is_new": bool, "profile": "..."}"""
-
-        user_prompt = f"""
-                [PREVIOUS NARRATIVE CONTEXT] (What happened immediately before):
-                \"\"\"
-                {prev_context_str}
-                \"\"\"
-
-                [CURRENT TEXT CHUNK]: 
-                "{context_text}"
-
-                [CANDIDATE ENTITIES] (Recently active):
-                {recent_active_entities_str}
-
-                [GLOBAL KNOWLEDGE]:
-                {other_globally_relevant_entities_str}
-
-                Task: Resolve the entity mention "{candidate_entity_name}".
-
-                Thinking Process:
-                1. Look at [PREVIOUS NARRATIVE CONTEXT]. Who was the last person speaking or acting?
-                2. If "{candidate_entity_name}" is "He"/"She", map it to that person.
-                3. If strict match found in [CANDIDATE ENTITIES], use it.
-
-                Output JSON: {{"canonical_name": "...", "is_new": bool, "profile": "..."}}
-                """
-
-        try:
-            raw_response, _, _ = self.llm.infer(
-                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-                temperature=0.0, response_format={"type": "json_object"}
-            )
-            response_data = json.loads(raw_response)
-
-            canonical_name = response_data.get("canonical_name", candidate_entity_name).strip()
-            assert canonical_name and isinstance(canonical_name, str), \
-                f"LLM resolver error: 'canonical_name' must be a non-empty string. Got: {canonical_name}"
-
-            is_new = response_data.get("is_new", True)
-            profile = response_data.get("profile", "")
-
-            # Update registry
-            if is_new and canonical_name not in self.registry:
-                self.registry[canonical_name] = {
-                    "profile": profile,
-                    "aliases": [candidate_entity_name],
-                    "first_seen": chunk_id}
-                logger.info(f"Registered new entity: {canonical_name}")
-            elif canonical_name in self.registry and candidate_entity_name not in self.reverse_lookup:
-                # If it's an existing canonical name but a new alias, add the alias
-                if candidate_entity_name not in self.registry[canonical_name].get("aliases", []):
-                    self.registry[canonical_name]["aliases"].append(candidate_entity_name)
-
-            # 5. 更新反向查找表
-            self.reverse_lookup[candidate_entity_name] = canonical_name
-            # 确保 Canonical Name 自己也能查到自己
-            if canonical_name not in self.reverse_lookup:
-                self.reverse_lookup[canonical_name] = canonical_name
-
-            # 6. [Rashomon Fix] 更新短期记忆
-            # 将解析出的结果放入滑动窗口头部
-            if canonical_name in self.recent_entities:
-                self.recent_entities.remove(canonical_name)  # 移出旧位置
-            self.recent_entities.appendleft(canonical_name)  # 放到最前
-
-            self._save()
-            return canonical_name
-
-        except Exception as e:
-            logger.error(f"LLM resolution failed for '{candidate_entity_name}': {e}. Treating as new.")
-            assert candidate_entity_name and isinstance(candidate_entity_name, str), \
-                "Fallback error: candidate_entity_name is somehow invalid."
-
-            if candidate_entity_name not in self.registry:
-                self.registry[candidate_entity_name] = {"profile": "Auto-registered due to error.",
-                                                        "aliases": [candidate_entity_name]}
-            self.reverse_lookup[candidate_entity_name] = candidate_entity_name
-            self.recent_entities.appendleft(candidate_entity_name)
-            return candidate_entity_name
 
     def add_profile_trait(self, canonical_name: str, trait_text: str):
         """
@@ -189,35 +66,81 @@ class GlobalEntityRegistry:
 
         # 确保实体在 registry 中存在
         if canonical_name not in self.registry:
-            # 如果实体还不存在，先创建一个基本结构
+            # 如果实体还不存在
             self.registry[canonical_name] = {
                 "profile": [],  # 默认 profile 为空列表
                 "aliases": [],
-                "first_seen": "N/A" # 或者你可以根据实际情况传递 chunk_id
+                "first_seen": "N/A"  # 或者你可以根据实际情况传递 chunk_id
             }
 
-        entity_data = self.registry[canonical_name]
+        data = self.registry[canonical_name]
+        if "profile" not in data or not isinstance(data["profile"], list):
+            data["profile"] = []
 
-        # 确保 'profile' 键存在且其值是一个列表
-        if "profile" not in entity_data or not isinstance(entity_data["profile"], list):
-            entity_data["profile"] = [] # 如果不是列表，则重新初始化为列表
-
-        # 避免重复添加完全相同的描述
-        if trait_text not in entity_data["profile"]:
-            entity_data["profile"].append(trait_text)
-            # === [NEW] 打印日志到控制台 ===
-            print(f"   [DEBUG-REGISTRY] 📝 Added trait to '{canonical_name}': '{trait_text}'")
-            # ==============================
+        if trait_text not in data["profile"]:
+            data["profile"].append(trait_text)
+            logger.info(f"Updated profile for {canonical_name}: {trait_text}")
             self._save()
-        else:
-            # === [NEW] 打印日志到控制台 ===
-            print(f"   [DEBUG-REGISTRY] 🔄 Trait already exists for '{canonical_name}', skipping.")
-            # ==============================
 
+    def resolve_and_add(self, candidate_entity_name: str, context_text: str, chunk_id: str,
+                        top_k: int = 5) -> str:
+        """Synchronously resolves or adds an entity."""
+        name = candidate_entity_name.strip()
+        if not name: return ""
+
+        # 1. 缓存命中
+        if name in self.reverse_lookup:
+            canonical = self.reverse_lookup[name]
+            if canonical not in self.recent_entities: self.recent_entities.appendleft(canonical)
+            return canonical
+
+        # 2. LLM Resolution
+        prev_context = "\n---\n".join(self.context_history) if self.context_history else "None"
+        recent, global_ents = self.get_formatted_entities_for_prompt(name, top_k)
+
+        prompt = f"""
+                [PREVIOUS CONTEXT]:\n{prev_context}\n
+                [CURRENT TEXT]: "{context_text}"\n
+                [CANDIDATES]:\n{recent}\n
+                [GLOBAL KNOWLEDGE]:\n{global_ents}\n
+
+                Task: Resolve entity mention "{name}".
+                Output JSON: {{"canonical_name": "...", "is_new": bool}}
+                """
+
+        try:
+            raw, _, _ = self.llm.infer(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0, response_format={"type": "json_object"}
+            )
+            data = json.loads(raw)
+            canonical = data.get("canonical_name", name).strip()
+
+            # 注册新实体
+            if data.get("is_new", True) and canonical not in self.registry:
+                self.registry[canonical] = {"profile": [], "aliases": [name], "first_seen": chunk_id}
+            elif canonical in self.registry:
+                if name not in self.registry[canonical].get("aliases", []):
+                    self.registry[canonical]["aliases"].append(name)
+
+            # 更新查找表
+            self.reverse_lookup[name] = canonical
+            if canonical not in self.reverse_lookup: self.reverse_lookup[canonical] = canonical
+
+            # 更新短期记忆
+            if canonical in self.recent_entities: self.recent_entities.remove(canonical)
+            self.recent_entities.appendleft(canonical)
+
+            self._save()
+            return canonical
+
+        except Exception as e:
+            logger.error(f"Resolution failed for {name}: {e}")
+            return name
 
     def get_formatted_entities_for_prompt(self,
                                           candidate_entity_name: Optional[str] = None,
-                                          top_k_global_relevant: int = 5) -> Tuple[str, str]:
+                                          top_k: int = 5) -> Tuple[str, str]:
         """
         Formats known entities into two sections for the LLM prompt:
         1. Recently Active Entities: from the deque.
@@ -268,7 +191,7 @@ class GlobalEntityRegistry:
 
                 if existing_canonical_entity_names:
                     similarities = np.dot(np.array(existing_canonical_entity_embeddings), candidate_embedding)
-                    top_k_indices = np.argsort(similarities)[::-1][:top_k_global_relevant]
+                    top_k_indices = np.argsort(similarities)[::-1][:top_k]
 
                     for idx in top_k_indices:
                         name = existing_canonical_entity_names[idx]
@@ -280,7 +203,7 @@ class GlobalEntityRegistry:
             else:  # Fallback: 如果没有 candidate 或嵌入模型，或者实体太少，直接列出部分
                 # 避免过度，只从 registry 中取出几个，或者不使用相似度
                 for i, name in enumerate(all_canonical_names_to_consider):
-                    if i >= top_k_global_relevant:
+                    if i >= top_k:
                         break
                     data = self.registry[name]
                     aliases_str = f" (aka: {', '.join(data.get('aliases', []))})" if data.get('aliases') else ""

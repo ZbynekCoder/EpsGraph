@@ -225,7 +225,6 @@ class PropRAG:
             all_openie_info,
             new_rows,
             new_ner,
-            None,
             new_props_raw
         )
         self.openie_info = updated_openie_info
@@ -766,7 +765,6 @@ class PropRAG:
                              all_openie_info: List[dict],
                              chunks_to_save: Dict[str, dict],
                              ner_results_dict: Dict[str, NerRawOutput],
-                             proposition_results_dict_triples: Dict[str, PropositionRawOutput], # Renamed from triple_results_dict
                              proposition_results_dict_props: Dict[str, PropositionRawOutput] = None) -> List[dict]: # Renamed from proposition_results_dict
         """
         Merges OpenIE extraction results with corresponding passage and metadata.
@@ -796,35 +794,23 @@ class PropRAG:
         """
 
         for chunk_key, row in chunks_to_save.items():
-            passage = row['content']
-            chunk_openie_info = {
+            info = {
                 'idx': chunk_key,
-                'passage': passage,
+                'passage': row['content'],
                 'extracted_entities': ner_results_dict[chunk_key].unique_entities,
+                'extracted_triples': [],
+                'propositions': [],
+                'traits': []
             }
 
-            # 1. 处理 Legacy Triples (如果存在)
-            if proposition_results_dict_triples is not None and chunk_key in proposition_results_dict_triples:
-                chunk_openie_info['extracted_triples'] = proposition_results_dict_triples[chunk_key].propositions
-            else:
-                chunk_openie_info['extracted_triples'] = []
-
-                # 2. 处理 Main Propositions (Beliefs) 和 Traits
-            # 我们从这里获取 traits，因为它是从 EnhancedOpenIE 的 extraction 步骤一起来的
+            # 处理 Beliefs 和 Traits
             if proposition_results_dict_props and chunk_key in proposition_results_dict_props:
-                # 保存 Beliefs
-                chunk_openie_info['propositions'] = proposition_results_dict_props[chunk_key].propositions
+                res = proposition_results_dict_props[chunk_key]
+                info['propositions'] = res.propositions
+                if hasattr(res, 'traits'):
+                    info['traits'] = res.traits
 
-                # [NEW] 保存 Traits
-                # 检查属性是否存在，因为 proposition_results_dict_props 是 PropositionRawOutput 对象
-                if hasattr(proposition_results_dict_props[chunk_key], 'traits'):
-                    chunk_openie_info['traits'] = proposition_results_dict_props[chunk_key].traits
-
-            # 只是为了安全起见，如果字典里还没有 'traits' 键，初始化为空列表
-            if 'traits' not in chunk_openie_info:
-                chunk_openie_info['traits'] = []
-
-            all_openie_info.append(chunk_openie_info)
+            all_openie_info.append(info)
 
         return all_openie_info
 

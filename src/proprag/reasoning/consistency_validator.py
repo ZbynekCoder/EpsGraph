@@ -2,9 +2,6 @@ import json
 import logging
 from typing import List, Dict, Any, Optional
 
-# from ..llm.base import BaseLLM # 如果需要直接传 LLM 实例
-from src.proprag.llm.openai_gpt import CacheOpenAI  # 假设你用的是 CacheOpenAI
-
 logger = logging.getLogger(__name__)
 
 
@@ -34,72 +31,45 @@ class ConsistencyValidator:
         """
 
         # 1. 格式化 Agent 的记忆
-        memory_context = ""
-        if not retrieved_memories:
-            memory_context = f"Agent {agent_name} has no directly related prior beliefs on record."
-        else:
-            memory_context = f"Agent {agent_name}'s known prior beliefs (related to '{new_belief_text[:50]}...'):\n"
-            for i, p in enumerate(retrieved_memories):
-                # 提取路径中 Belief 节点的文本，忽略 Agent/Entity 节点
-                belief_texts = [text for j, text in enumerate(p['texts']) if p['nodes'][j].startswith("proposition-")]
-                # 优先使用路径末端的 Belief，因为它与 query 最相关
-                core_belief_text = belief_texts[-1] if belief_texts else "Unknown Belief"
-                memory_context += f"- {core_belief_text} (Source: {p.get('source', agent_name)})\n"  # Path owner check
+        memory_txt = "\n".join(
+            [f"- {m['text']} (Source: {m['source']})" for m in retrieved_memories]) if retrieved_memories else "None."
+        persona_txt = agent_persona if agent_persona else "Unknown Persona."
 
-        # 2. 构建 Prompt
         system_prompt = f"""
-        You are an AI Auditor. Your task is to analyze whether a new statement by Agent '{agent_name}' 
-        is consistent with their previously recorded beliefs and persona.
+                You are an AI Auditor analyzing Cognitive Consistency.
+                Target Agent: '{agent_name}'
 
-        Agent Name: {agent_name}
-        {f"Agent Persona: {agent_persona}" if agent_persona else ""}
+                Tasks:
+                1. Check consistency with **Persona** (Traits): Is the statement Out-Of-Character?
+                2. Check consistency with **Memory** (Prior Beliefs): Does it contradict past statements?
 
-        Evaluate the new statement against the agent's prior beliefs.
-
-        Output a JSON object with two fields:
-        - "status": "Consistent", "Inconsistent", or "Neutral" (if no clear conflict/support)
-        - "reasoning": A detailed explanation of your judgment. If inconsistent, explain why.
-        """
+                Output JSON: {{"status": "Consistent"|"Inconsistent"|"Neutral", "reasoning": "..."}}
+                """
 
         user_prompt = f"""
-        Prior Beliefs/Memory for Agent '{agent_name}':
-        {memory_context}
+                [AGENT PROFILE]:
+                {persona_txt}
 
-        New Statement/Action by Agent '{agent_name}':
-        "{new_belief_text}"
+                [RELEVANT MEMORIES]:
+                {memory_txt}
 
-        Is this new statement consistent with {agent_name}'s prior beliefs/persona?
-        """
+                [NEW STATEMENT]:
+                "{new_belief_text}"
 
-        logger.debug(f"Calling LLM for consistency validation for agent {agent_name}.")
-        logger.debug(f"Prompt:\n{user_prompt}")
+                Audit this statement.
+                """
 
         try:
-            raw_response, metadata, _ = self.llm.infer(
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.0,  # 确保判断结果稳定
-                response_format={"type": "json_object"}
+            raw, _, _ = self.llm.infer(
+                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+                temperature=0.0, response_format={"type": "json_object"}
             )
-
-            # 尝试解析 JSON
-            response_data = json.loads(raw_response)
-            status = response_data.get("status", "Error").strip()
-            reasoning = response_data.get("reasoning", "Failed to parse reasoning.").strip()
-
+            data = json.loads(raw)
+            return {
+                "status": data.get("status", "Error"),
+                "reasoning": data.get("reasoning", "Parse Error")
+            }
         except Exception as e:
-            logger.error(f"Error during consistency validation LLM call for {agent_name}: {e}")
-            status = "Error"
-            reasoning = f"LLM call failed: {e}"
-            raw_response = {}  # Ensure raw_response is defined
-
-        return {
-            "agent": agent_name,
-            "new_belief": new_belief_text,
-            "status": status,
-            "reasoning": reasoning,
-            "llm_response_raw": raw_response  # 方便调试
-        }
+            logger.error(f"Validation failed: {e}")
+            return {"status": "Error", "reasoning": str(e)}
 

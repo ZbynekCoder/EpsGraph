@@ -13,6 +13,7 @@ from ..utils.misc_utils import PropositionRawOutput, RetryExecutor
 
 logger = get_logger(__name__)
 
+
 class PropositionExtractor:
     """
     Class to extract propositions and traits from passages.
@@ -32,127 +33,62 @@ class PropositionExtractor:
 
     def extract_propositions(self, chunk_key: str, passage: str, named_entities: Optional[List[str]] = None,
                              temperature=0.0, use_cache=True) -> PropositionRawOutput:
-        """
-        Extract propositions (beliefs) and traits from a passage.
-        """
-        # --- 1. Prompt Construction ---
-        recent_active_entities_str = "None"
-        other_globally_relevant_entities_str = "None"
-
+        # 1. 准备 Context
+        recent, global_ents = "None", "None"
         if self.entity_registry:
-            recent_active_entities_str, other_globally_relevant_entities_str = \
-                self.entity_registry.get_formatted_entities_for_prompt(
-                    candidate_entity_name=None,
-                    top_k_global_relevant=10
-                )
+            recent, global_ents = self.entity_registry.get_formatted_entities_for_prompt(top_k=10)
 
-        if named_entities is None:
-            named_entities = []
-
-        # Rendering the prompt
-        # Ensure your PromptTemplateManager uses the NEW logic (Subjective/Objective split)
-        proposition_input_message = self.prompt_template_manager.render(
+        # 2. 调用 LLM
+        prompt = self.prompt_template_manager.render(
             name='proposition_extraction',
             passage=passage,
-            named_entities=json.dumps(named_entities),
-            recent_active_entities=recent_active_entities_str,
-            other_globally_known_entities=other_globally_relevant_entities_str
+            named_entities=json.dumps(named_entities or []),
+            recent_active_entities=recent,
+            other_globally_known_entities=global_ents
         )
 
-        # --- 2. LLM Inference ---
-        # No try-except here. If LLM API fails, let it crash so we know.
         raw_response, metadata, _ = self.llm_model.infer(
-            messages=proposition_input_message,
-            temperature=temperature,
-            response_format={"type": "json_object"},
-            use_cache=use_cache
+            messages=prompt, temperature=temperature, response_format={"type": "json_object"}, use_cache=use_cache
         )
 
-        # --- 3. Parsing & Cleaning ---
+        # 3. 解析 JSON (Fail Fast)
         try:
-            parsed_json = json.loads(raw_response)
+            data = json.loads(raw_response)
         except json.JSONDecodeError:
-            logger.error(f"JSON Decode Error for chunk {chunk_key}. Response: {raw_response[:100]}...")
-            # Return empty structure on parse failure, or raise error if you prefer strictness
-            return PropositionRawOutput(chunk_key, raw_response, [], {}, [], metadata)
+            logger.error(f"JSON Parse Error for {chunk_key}: {raw_response[:50]}...")
+            return PropositionRawOutput(chunk_key, raw_response, [], metadata, [])
 
-        # Defensive access: ensure lists
-        raw_beliefs = parsed_json.get("beliefs", [])
-        if not isinstance(raw_beliefs, list): raw_beliefs = []
-
-        raw_traits = parsed_json.get("traits", [])
-        if not isinstance(raw_traits, list): raw_traits = []
-
-        # --- 4. Logic Branching: With vs Without Registry ---
-
-        canonical_propositions = [] # Maps to 'beliefs'
-        canonical_traits = []       # Maps to 'traits'
+        # 4. 规范化 & 写入 Registry
+        canonical_props = []
+        canonical_traits = []
 
         if self.entity_registry:
-            # === Process Beliefs ===
-            for belief in raw_beliefs:
-                # 4.1. Clean Data: Ensure entities is a list
-                ents = belief.get("entities")
-                if ents is None:
-                    ents = []
-                elif not isinstance(ents, list):
-                    # Handle case where LLM outputs single string instead of list
-                    ents = [str(ents)]
+            # 处理 Beliefs
+            for item in data.get("beliefs", []):
+                src = self.entity_registry.resolve_and_add(item.get("source", "GlobalContext"), passage, chunk_key)
+                ents = [self.entity_registry.resolve_and_add(e, passage, chunk_key)
+                        for e in (item.get("entities") if isinstance(item.get("entities"), list) else [])]
 
-                # 4.2. Resolve Source (e.g., "He" -> "Jenner")
-                source = belief.get("source", "GlobalContext")
-                canonical_source = self.entity_registry.resolve_and_add(source, passage, chunk_key)
+                item["source"] = src
+                item["entities"] = [e for e in ents if e]  # 过滤空值
+                canonical_props.append(item)
 
-                # 4.3. Resolve Entities
-                canonical_entities = []
-                for entity_name in ents:
-                    canonical_entity = self.entity_registry.resolve_and_add(entity_name, passage, chunk_key)
-                    if canonical_entity:
-                        canonical_entities.append(canonical_entity)
+            # 处理 Traits (副作用：更新 Profile)
+            for item in data.get("traits", []):
+                ent = self.entity_registry.resolve_and_add(item.get("entity"), passage, chunk_key)
+                trait = item.get("trait")
+                if ent and trait:
+                    self.entity_registry.add_profile_trait(ent, trait)
+                    canonical_traits.append({"entity": ent, "trait": trait})
 
-                # 4.4. Reconstruct Belief
-                belief["source"] = canonical_source
-                belief["entities"] = list(set(canonical_entities))
-                canonical_propositions.append(belief)
-
-            # === Process Traits ===
-            for trait_item in raw_traits:
-                entity_name = trait_item.get("entity")
-                trait_text = trait_item.get("trait")
-
-                if entity_name and trait_text:
-                    # Resolve Entity
-                    canonical_entity = self.entity_registry.resolve_and_add(entity_name, passage, chunk_key)
-
-                    # Update Registry Profile (Side Effect)
-                    self.entity_registry.add_profile_trait(canonical_entity, trait_text)
-
-                    # Add to output list
-                    canonical_traits.append({
-                        "entity": canonical_entity,
-                        "trait": trait_text
-                    })
-
-            # === Update History Context ===
-            # This is crucial for the "Previous Context" logic in EntityRegistry
+            # 更新历史上下文
             self.entity_registry.update_context_history(passage)
-
         else:
-            # No Registry: Pass through raw data but clean 'entities' field
-            for belief in raw_beliefs:
-                if belief.get("entities") is None:
-                    belief["entities"] = []
-                canonical_propositions.append(belief)
-            canonical_traits = raw_traits
+            # 无 Registry 模式
+            canonical_props = data.get("beliefs", [])
+            canonical_traits = data.get("traits", [])
 
-        # --- 5. Return ---
-        return PropositionRawOutput(
-            chunk_id=chunk_key,
-            response=raw_response,
-            propositions=canonical_propositions, # 'beliefs' go here
-            metadata=metadata,
-            traits=canonical_traits              # 'traits' go here
-        )
+        return PropositionRawOutput(chunk_key, raw_response, canonical_props, metadata, canonical_traits)
 
     def batch_extract_propositions(self, chunks: Dict[str, Dict],
                                    named_entities_dict: Optional[Dict[str, List[str]]] = None) -> Dict[str, PropositionRawOutput]:
@@ -167,10 +103,9 @@ class PropositionExtractor:
         total_completion_tokens = 0
         num_cache_hit = 0
 
-        with ThreadPoolExecutor(max_workers=300) as executor: # Adjust max_workers as needed
+        with ThreadPoolExecutor(max_workers=300) as executor:  # Adjust max_workers as needed
             proposition_futures = {}
             for chunk_key, passage in chunk_passages.items():
-
                 # Get NER results if available
                 named_entities = named_entities_dict.get(chunk_key, []) if named_entities_dict else []
 
@@ -180,7 +115,8 @@ class PropositionExtractor:
             # Using RetryExecutor to handle transient failures
             with RetryExecutor(executor, proposition_futures,
                                lambda chunk_key: ((self.extract_propositions, chunk_key, chunk_passages[chunk_key],
-                                                   named_entities_dict.get(chunk_key, []) if named_entities_dict else []), {}),
+                                                   named_entities_dict.get(chunk_key,
+                                                                           []) if named_entities_dict else []), {}),
                                desc="Extracting propositions") as retry_exec:
 
                 def process_result(future, chunk_key, pbar):
