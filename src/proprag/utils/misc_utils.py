@@ -1,5 +1,5 @@
 from argparse import ArgumentTypeError
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from hashlib import md5
 from typing import Dict, Any, List, Tuple, Literal, Union, Optional, TypeVar, Generic, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed, Future
@@ -22,6 +22,7 @@ class PropositionRawOutput:
     response: str
     propositions: List[Dict[str, Any]]  # List of proposition objects with text and entities
     metadata: Dict[str, Any] = None
+    traits: List[Dict] = field(default_factory=list)
 
 @dataclass
 class NerRawOutput:

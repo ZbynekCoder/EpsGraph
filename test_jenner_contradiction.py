@@ -99,6 +99,48 @@ def main():
         rag.global_config.force_index_from_scratch = False
         rag.index([doc])
 
+        # === [NEW] 调试输出：查看刚才提取到的 Traits ===
+        try:
+            # 1. 获取当前文档的 hash id
+            current_chunk_key = rag.chunk_embedding_store.text_to_hash_id.get(doc)
+
+            # 2. 从 rag.openie_info (List) 中查找对应的信息
+            found_info = None
+            if hasattr(rag, 'openie_info') and isinstance(rag.openie_info, list):
+                # 遍历列表查找 idx 匹配的项
+                for item in rag.openie_info:
+                    if item.get('idx') == current_chunk_key:
+                        found_info = item
+                        break
+
+            if found_info:
+                # 打印 Traits
+                traits = found_info.get('traits', [])
+                if traits:
+                    print(f"   [DEBUG] ✅ Traits Extracted ({len(traits)}):")
+                    for t in traits:
+                        ent = t.get('entity', 'Unknown')
+                        desc = t.get('trait', 'No Desc')
+                        print(f"      - Entity: '{ent}' -> Trait: '{desc}'")
+                else:
+                    print("   [DEBUG] ⚠️ No traits found in extraction result.")
+
+                # 打印 Beliefs
+                beliefs = found_info.get('propositions', [])
+                if beliefs:
+                    print(f"   [DEBUG] ✅ Beliefs Extracted ({len(beliefs)}):")
+                    for b in beliefs:
+                        print(f"      - {b['source']}: {b['text'][:50]}...")
+                else:
+                    print("   [DEBUG] ⚠️ No beliefs found in extraction result.")
+
+            else:
+                print(f"   [DEBUG] ❓ Could not find chunk {current_chunk_key} in rag.openie_info list.")
+
+        except Exception as e:
+            print(f"   [DEBUG] ❌ Debug print failed: {e}")
+        # ===============================================
+
         # 3. [比对] 计算新增的 Keys
         keys_after = set(rag.proposition_to_entities_map.keys())
         new_prop_keys = list(keys_after - keys_before)

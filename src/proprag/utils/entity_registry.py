@@ -179,6 +179,42 @@ class GlobalEntityRegistry:
             self.recent_entities.appendleft(candidate_entity_name)
             return candidate_entity_name
 
+    def add_profile_trait(self, canonical_name: str, trait_text: str):
+        """
+        将提取出的特质(trait)添加到实体的 profile 中。
+        如果实体 profile 字段不存在或不是列表，则进行初始化。
+        """
+        if not canonical_name or not trait_text:
+            return
+
+        # 确保实体在 registry 中存在
+        if canonical_name not in self.registry:
+            # 如果实体还不存在，先创建一个基本结构
+            self.registry[canonical_name] = {
+                "profile": [],  # 默认 profile 为空列表
+                "aliases": [],
+                "first_seen": "N/A" # 或者你可以根据实际情况传递 chunk_id
+            }
+
+        entity_data = self.registry[canonical_name]
+
+        # 确保 'profile' 键存在且其值是一个列表
+        if "profile" not in entity_data or not isinstance(entity_data["profile"], list):
+            entity_data["profile"] = [] # 如果不是列表，则重新初始化为列表
+
+        # 避免重复添加完全相同的描述
+        if trait_text not in entity_data["profile"]:
+            entity_data["profile"].append(trait_text)
+            # === [NEW] 打印日志到控制台 ===
+            print(f"   [DEBUG-REGISTRY] 📝 Added trait to '{canonical_name}': '{trait_text}'")
+            # ==============================
+            self._save()
+        else:
+            # === [NEW] 打印日志到控制台 ===
+            print(f"   [DEBUG-REGISTRY] 🔄 Trait already exists for '{canonical_name}', skipping.")
+            # ==============================
+
+
     def get_formatted_entities_for_prompt(self,
                                           candidate_entity_name: Optional[str] = None,
                                           top_k_global_relevant: int = 5) -> Tuple[str, str]:
