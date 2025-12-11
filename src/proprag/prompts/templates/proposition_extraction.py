@@ -1,22 +1,21 @@
 from ...utils.llm_utils import convert_format_to_template
 
-proposition_system = """Your task is to analyze text passages and extract 'Belief Triples' to construct a cognitive graph.
+proposition_system = """You are an expert in narrative analysis. Your task is to extract propositions (atomic beliefs or events) from a given text.
+For each proposition, identify the 'source' (who holds the belief or performs the action), the 'attitude' (e.g., states, claims, believes, denies), the 'text' of the belief, and the 'entities' involved.
 
-A **Belief Triple** represents a specific agent's subjective view. It consists of:
-1. **source**: The entity holding the belief (e.g., "Tom", "The report"). If it is an objective fact, use "GlobalContext".
-2. **attitude**: The verb connecting the agent to the claim (e.g., "believes", "claims", "denies", "reported").
-3. **text**: The content of the belief as a standalone statement.
-4. **entities**: A list of specific entities involved in the proposition.
-
-**CRITICAL: Reference Resolution**: You MUST replace pronouns (he, she, it) and ambiguous references (this individual, the meeting) with specific names in the "text" field.
-  - BAD: "He met him."
-  - GOOD: "Governor Smith met the anonymous source."
+**Critical Instructions for Coreference Resolution and Source Identification:**
+1.  **Prioritize Recently Active Entities**: If a pronoun (e.g., "He", "She", "They") or an ambiguous reference (e.g., "the source", "the plan") is used as a source or as an entity within the proposition, you MUST first attempt to resolve it to a specific character from the **'Recently Active Entities'** list. These are highly relevant and likely candidates for ambiguous references in the current passage.
+2.  **Then Check Globally Known Entities**: If not found in 'Recently Active Entities', try to resolve it from the 'Other Globally Known Entities' list. These entities are also known to the system and may be relevant.
+3.  **If Unresolvable**: If a source or an entity cannot be confidently resolved from the provided lists, use "Unknown Speaker" for source or the exact phrase from the text for entities.
+4.  The 'source' should be the most specific agent possible (e.g., "Jenner" instead of "a rat").
+5.  The 'text' should be a complete, self-contained statement.
+6.  The 'entities' list should contain the **canonical names** of all resolved entities involved in the belief.
 
 ### Output Format:
-You MUST respond with a valid JSON object containing a list of "beliefs".
+You MUST respond with a valid JSON object containing a list of "propositions" (or "beliefs").
 JSON Format:
 {
-  "beliefs": [
+  "propositions": [
     {
       "source": "string",
       "attitude": "string",
@@ -29,10 +28,12 @@ JSON Format:
 ### Example:
 Passage: Trump claimed that he won the election, but CNN reported that Biden won.
 Named entities: ["Trump", "election", "CNN", "Biden"]
+Recently Active Entities: ["Trump"]
+Other Globally Known Entities: ["Biden", "CNN"]
 
 Response:
 {
-  "beliefs": [
+  "propositions": [
     {
       "source": "Trump",
       "attitude": "claimed",
@@ -104,10 +105,18 @@ Passage:
 {passage}
 ```
 
-Named entities from current chunk: {named_entities}
+Pre-identified entities directly from this passage:
+{named_entities}
 
-Known Canonical Entities from Global Registry (use these names if applicable):
-{known_entities}"""
+[Contextual Information for Coreference Resolution]
+Recently Active Entities (mentioned in recent passages, HIGH PRIORITY for pronouns/references):
+{recent_active_entities}
+
+Other Globally Known Entities (for broader context, ranked by relevance):
+{other_globally_known_entities}
+
+Extract all propositions from the passage, resolving all pronouns and ambiguous references to the most specific known entity from the lists above.
+"""
 
 prompt_template = [
     {"role": "system", "content": proposition_system},

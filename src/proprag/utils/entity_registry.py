@@ -1,20 +1,28 @@
 import json
 import os
 import logging
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from collections import deque
+
+import numpy as np
+
+from src.proprag.utils.misc_utils import compute_mdhash_id
 
 logger = logging.getLogger(__name__)
 
 
 class GlobalEntityRegistry:
-    def __init__(self, llm_model: Any, save_path: Optional[str] = None):
+    def __init__(self, llm_model: Any, embedding_model: Any, entity_embedding_store: Any, save_path: Optional[str] = None):
         self.registry: Dict[str, Dict[str, Any]] = {}  # Canonical Name -> {profile, aliases}
         self.reverse_lookup: Dict[str, str] = {}  # Alias -> Canonical Name
 
         self.recent_entities = deque(maxlen=10)
 
         self.llm = llm_model
+        self.embedding_model = embedding_model
+        self.entity_embedding_store = entity_embedding_store
+        self._ensure_embeddings_for_registry()
+
         self.save_path = save_path
         if self.save_path and os.path.exists(self.save_path):
             self._load()
@@ -38,7 +46,19 @@ class GlobalEntityRegistry:
                 json.dump({"registry": self.registry, "reverse_lookup": self.reverse_lookup}, f, ensure_ascii=False,
                           indent=2)
 
-    def resolve_and_add(self, candidate_entity_name: str, context_text: str, chunk_id: str) -> str:
+    def _ensure_embeddings_for_registry(self):
+        canonical_names_to_embed = []
+        for name in self.registry.keys():
+            entity_hash_id = compute_mdhash_id(name, prefix="entity-")
+            if entity_hash_id not in self.entity_embedding_store.hash_id_to_row:
+                canonical_names_to_embed.append(name)
+
+        if canonical_names_to_embed:
+            logger.info(f"Embedding {len(canonical_names_to_embed)} new canonical entities for Registry.")
+            self.entity_embedding_store.insert_strings(canonical_names_to_embed)
+
+
+    def resolve_and_add(self, candidate_entity_name: str, context_text: str, chunk_id: str, top_k_global_relevant: int = 5) -> str:
         """Synchronously resolves or adds an entity."""
         assert candidate_entity_name and isinstance(candidate_entity_name,
                                                     str), "Candidate entity name must be a non-empty string."
@@ -48,53 +68,44 @@ class GlobalEntityRegistry:
 
         if candidate_entity_name in self.reverse_lookup:
             canonical = self.reverse_lookup[candidate_entity_name]
-            # [Rashomon Fix] 即使查到了，也要更新“最近活跃”，保持上下文新鲜
             if canonical not in self.recent_entities:
                 self.recent_entities.appendleft(canonical)
             return canonical
 
         # Use LLM for resolution
-        known_entities_lines = []
-        for name, data in self.registry.items():
-            aliases = data.get("aliases", [])
-            aliases_str = f" (Aliases: {', '.join(aliases)})" if aliases else ""
-            known_entities_lines.append(f"- {name}{aliases_str}: {data.get('profile', '')}")
-
-        known_entities_str = "\n".join(known_entities_lines) or "None"
-
-        # B. 短期记忆 (Working Memory) - 关键修改
-        # 将 deque 转为字符串列表，强调顺序 (越靠前越近)
-        recent_context_list = list(self.recent_entities)
-        recent_context_str = ", ".join(recent_context_list) if recent_context_list else "None"
+        recent_active_entities_str, other_globally_relevant_entities_str = self.get_formatted_entities_for_prompt(
+            candidate_entity_name=candidate_entity_name,
+            top_k_global_relevant=top_k_global_relevant
+        )
 
         system_prompt = """You are an Entity Resolver with Context Awareness. 
-        Your task is to resolve an entity mention in a text to its Canonical Name.
+                Your task is to resolve an entity mention in a text to its Canonical Name.
 
-        Priority of Resolution:
-        1. **Context Match**: If the mention refers to someone in the 'Recently Active Entities' list (e.g., 'the source' -> 'Anonymous Source'), mapping them is the HIGHEST priority.
-        2. **Global Match**: If not recent, check the 'Global Known Entities'.
-        3. **New Entity**: If strictly new, create a new canonical name.
+                Priority of Resolution:
+                1. **Context Match**: If the mention refers to someone in the 'Recently Active Entities' list (e.g., 'the source' -> 'Anonymous Source'), mapping them is the HIGHEST priority.
+                2. **Global Match**: If not recent, check the 'Globally Relevant Known Entities'.
+                3. **New Entity**: If strictly new, create a new canonical name.
 
-        Respond in JSON: {"canonical_name": "...", "is_new": bool, "profile": "..."}"""
+                Respond in JSON: {"canonical_name": "...", "is_new": bool, "profile": "..."}"""
 
         user_prompt = f"""
-        Current Text Chunk: "{context_text}"
+                Current Text Chunk: "{context_text}"
 
-        [CRITICAL CONTEXT] Recently Active Entities (mentioned in previous chunks):
-        [{recent_context_str}]
+                [CRITICAL CONTEXT] Recently Active Entities (mentioned in previous chunks):
+                {recent_active_entities_str}
 
-        [Knowledge Base] Global Known Entities:
-        {known_entities_str}
+                [Knowledge Base] Globally Relevant Known Entities (Top {top_k_global_relevant} by embedding similarity):
+                {other_globally_relevant_entities_str}
 
-        Task: Resolve the entity mention "{candidate_entity_name}".
+                Task: Resolve the entity mention "{candidate_entity_name}".
 
-        Thinking Process:
-        1. Is "{candidate_entity_name}" a pronoun or reference (e.g., "he", "the source", "the plan")?
-        2. If YES, does it likely refer to someone in [Recently Active Entities]?
-        3. If NO, is it a variation of a [Global Known Entity]?
+                Thinking Process:
+                1. Is "{candidate_entity_name}" a pronoun or reference (e.g., "he", "the source", "the plan")?
+                2. If YES, does it likely refer to someone in [Recently Active Entities]?
+                3. If NO, is it a variation of a [Globally Relevant Known Entities]?
 
-        Output JSON:
-        """
+                Output JSON:
+                """
 
         try:
             raw_response, _, _ = self.llm.infer(
@@ -148,6 +159,82 @@ class GlobalEntityRegistry:
             self.reverse_lookup[candidate_entity_name] = candidate_entity_name
             self.recent_entities.appendleft(candidate_entity_name)
             return candidate_entity_name
+
+    def get_formatted_entities_for_prompt(self,
+                                          candidate_entity_name: Optional[str] = None,
+                                          top_k_global_relevant: int = 5) -> Tuple[str, str]:
+        """
+        Formats known entities into two sections for the LLM prompt:
+        1. Recently Active Entities: from the deque.
+        2. Other Globally Relevant Known Entities: (optionally) top-k by embedding similarity to a candidate.
+
+        Returns:
+            Tuple[str, str]: (formatted_recent_entities_str, formatted_other_known_entities_str)
+        """
+        # 1. Recently Active Entities (from deque)
+        formatted_recent_entities = []
+        # [FIX] 确保 recent_entities 里的名字确实在 registry 里有详细数据
+        for name in self.recent_entities:
+            data = self.registry.get(name)
+            if data:
+                aliases_str = f" (aka: {', '.join(data.get('aliases', []))})" if data.get('aliases') else ""
+                profile_str = data.get('profile', 'No profile.')
+                formatted_recent_entities.append(f"- {name}{aliases_str}: {profile_str}")
+        recent_active_entities_str = "\n".join(formatted_recent_entities) or "None"
+
+        # 2. Other Globally Relevant Known Entities (Top-K if embedding_model available)
+        formatted_other_known_entities = []
+        if self.registry:
+            all_canonical_names_in_registry = list(self.registry.keys())
+
+            # 排除掉已经在 recently active 里的实体，避免重复
+            all_canonical_names_to_consider = [name for name in all_canonical_names_in_registry if
+                                               name not in self.recent_entities]
+
+            if candidate_entity_name and self.embedding_model and self.entity_embedding_store and all_canonical_names_to_consider:
+                self._ensure_embeddings_for_registry()  # 确保所有 canonical names 都有嵌入
+
+                # 嵌入 candidate_entity_name
+                candidate_embedding = self.embedding_model.batch_encode(
+                    [candidate_entity_name],
+                    norm=True
+                )[0]
+
+                existing_canonical_entity_names = []
+                existing_canonical_entity_embeddings = []
+
+                for name in all_canonical_names_to_consider:
+                    entity_hash_id = compute_mdhash_id(name, prefix="entity-")
+                    if entity_hash_id in self.entity_embedding_store.hash_id_to_row:
+                        embedding = self.entity_embedding_store.get_embedding(entity_hash_id)
+                        if embedding is not None and len(embedding) > 0:  # 确保嵌入有效
+                            existing_canonical_entity_names.append(name)
+                            existing_canonical_entity_embeddings.append(embedding)
+
+                if existing_canonical_entity_names:
+                    similarities = np.dot(np.array(existing_canonical_entity_embeddings), candidate_embedding)
+                    top_k_indices = np.argsort(similarities)[::-1][:top_k_global_relevant]
+
+                    for idx in top_k_indices:
+                        name = existing_canonical_entity_names[idx]
+                        data = self.registry[name]
+                        aliases_str = f" (aka: {', '.join(data.get('aliases', []))})" if data.get('aliases') else ""
+                        profile_str = data.get('profile', 'No profile.')
+                        formatted_other_known_entities.append(
+                            f"- {name}{aliases_str}: {profile_str} (Similarity: {similarities[idx]:.2f})")
+            else:  # Fallback: 如果没有 candidate 或嵌入模型，或者实体太少，直接列出部分
+                # 避免过度，只从 registry 中取出几个，或者不使用相似度
+                for i, name in enumerate(all_canonical_names_to_consider):
+                    if i >= top_k_global_relevant:
+                        break
+                    data = self.registry[name]
+                    aliases_str = f" (aka: {', '.join(data.get('aliases', []))})" if data.get('aliases') else ""
+                    profile_str = data.get('profile', 'No profile.')
+                    formatted_other_known_entities.append(f"- {name}{aliases_str}: {profile_str}")
+
+        other_known_entities_str = "\n".join(formatted_other_known_entities) or "None"
+
+        return recent_active_entities_str, other_known_entities_str
 
     def get_known_entities_for_prompt(self, max_tokens=1000) -> str:
         lines = []

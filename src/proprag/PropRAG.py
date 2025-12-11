@@ -105,13 +105,6 @@ class PropRAG:
 
         self.llm_model: BaseLLM = _get_llm_class(self.global_config)
 
-        logger.info("Using EnhancedOpenIE with proposition extraction")
-        registry_path = os.path.join(self.working_dir, "entity_registry.json")
-        self.entity_registry = GlobalEntityRegistry(llm_model=self.llm_model, save_path=registry_path)
-        self.openie = EnhancedOpenIE(llm_model=self.llm_model, entity_registry=self.entity_registry)
-
-        self.graph = self.initialize_graph()
-
         self.embedding_model: BaseEmbeddingModel = _get_embedding_model_class(self.global_config)
         self.chunk_embedding_store = EmbeddingStore(self.embedding_model,
                                                     os.path.join(self.working_dir, "chunk_embeddings"),
@@ -120,8 +113,20 @@ class PropRAG:
                                                      os.path.join(self.working_dir, "entity_embeddings"),
                                                      self.global_config.embedding_batch_size, 'entity')
         self.proposition_embedding_store = EmbeddingStore(self.embedding_model,
-                                                   os.path.join(self.working_dir, "proposition_embeddings"),
-                                                   self.global_config.embedding_batch_size, 'proposition')
+                                                          os.path.join(self.working_dir, "proposition_embeddings"),
+                                                          self.global_config.embedding_batch_size, 'proposition')
+
+        logger.info("Using EnhancedOpenIE with proposition extraction")
+        registry_path = os.path.join(self.working_dir, "entity_registry.json")
+
+        self.entity_registry = GlobalEntityRegistry(
+            llm_model=self.llm_model,
+            embedding_model=self.embedding_model,
+            entity_embedding_store=self.entity_embedding_store,
+            save_path=registry_path)
+        self.openie = EnhancedOpenIE(llm_model=self.llm_model, entity_registry=self.entity_registry)
+
+        self.graph = self.initialize_graph()
 
         self.prompt_template_manager = PromptTemplateManager(role_mapping={"system": "system", "user": "user", "assistant": "assistant"})
 

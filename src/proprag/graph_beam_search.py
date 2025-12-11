@@ -45,6 +45,10 @@ class BeamSearchPathFinder:
         g = self.rag.graph
         nodes = g.vs
 
+        self.agent_beliefs_cache.clear()
+        self.belief_entities_cache.clear()
+        self.entity_beliefs_cache.clear()
+
         # 简单的 Debug 开关，避免刷屏
         debug_mode = logger.isEnabledFor(logging.DEBUG)
 

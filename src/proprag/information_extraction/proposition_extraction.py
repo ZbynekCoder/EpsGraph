@@ -54,14 +54,33 @@ class PropositionExtractor:
             PropositionRawOutput object containing the propositions and metadata
         """
         # 1. Prepare Prompt
-        known_entities_for_prompt = self.entity_registry.get_known_entities_for_prompt() if self.entity_registry else "None"
-        if named_entities is None: named_entities = []
+        recent_active_entities_str = "None"
+        other_globally_relevant_entities_str = "None"
+
+        if self.entity_registry:
+            # For proposition extraction, the 'candidate_entity_name' for Top-K relevance is the current passage itself,
+            # but for coreference, we want to give *all* recently active and a broad set of global.
+            # So, we pass None as candidate_entity_name to get a general list or can iterate over current named_entities.
+            # For simplicity now, let's just use the general one.
+            recent_active_entities_str, other_globally_relevant_entities_str = \
+                self.entity_registry.get_formatted_entities_for_prompt(
+                    candidate_entity_name=None,  # For proposition extraction, no specific single candidate_entity_name
+                    top_k_global_relevant=10  # Get a reasonable number of global entities
+                )
+
+        # 安全检查: 确保 named_entities 是列表
+        if named_entities is None:
+            named_entities = []
+        elif not isinstance(named_entities, list):
+            logger.warning(f"named_entities expected list, got {type(named_entities)}. Resetting to empty.")
+            named_entities = []
 
         proposition_input_message = self.prompt_template_manager.render(
             name='proposition_extraction',
             passage=passage,
-            named_entities=json.dumps(named_entities) if named_entities else "[]",
-            known_entities=known_entities_for_prompt
+            named_entities=json.dumps(named_entities),
+            recent_active_entities=recent_active_entities_str,
+            other_globally_known_entities=other_globally_relevant_entities_str
         )
 
         # 2. Extract Raw Beliefs
